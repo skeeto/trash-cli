@@ -50,8 +50,8 @@ typedef size_t    uz;
 // the platform layer below, so the core names them itself.
 enum : i32 {
     EPERM = 1, ENOENT = 2, EINTR = 4, EACCES = 13, EEXIST = 17, EXDEV = 18,
-    ENOTDIR = 20, EISDIR = 21, ENOSPC = 28, EROFS = 30, ENAMETOOLONG = 36,
-    ENOTEMPTY = 39, ELOOP = 40,
+    ENOTDIR = 20, EISDIR = 21, EINVAL = 22, ENOSPC = 28, EROFS = 30,
+    ENAMETOOLONG = 36, ENOTEMPTY = 39, ELOOP = 40, EDQUOT = 122,
 };
 
 
@@ -158,7 +158,9 @@ static i32                os_errno(Os *);
 static Str                os_strerror(Os *, i32 err);
 // This executable's own path, in *a.
 static Str                os_selfexe(Os *, Arena *a);
-// The current working directory, in *a.
+// Columns of the terminal on stdout, 0 when stdout is not one.
+static iz                 os_termwidth(Os *);
+// The current working directory, in *a; a null Str with errno set on failure.
 static Str                os_getcwd(Os *, Arena *a);
 // A pseudo-random 64-bit value (trash name collision suffixes).
 static u64                os_rand(Os *);
@@ -273,6 +275,21 @@ static Str concat(Arena *a, Str head, Str tail)
     return head;
 }
 
+static Str istr(Arena *a, i64 x)
+{
+    u8  buf[32];
+    u8 *end = buf + countof(buf);
+    u8 *beg = end;
+    i64 t   = x < 0 ? x : -x;
+    do {
+        *--beg = (u8)('0' - (i32)(t%10));
+    } while (t /= 10);
+    if (x < 0) {
+        *--beg = '-';
+    }
+    return clone(a, span(beg, end));
+}
+
 typedef struct {
     Str head;
     Str tail;
@@ -292,68 +309,119 @@ static Cut cut(Str s, u8 c)
     return r;
 }
 
-static b32 space(u8 c)
+static iz utf8_seq(Str s, iz i);
+
+// Unicode: whitespace as str.isspace(), and decimal digits (category Nd,
+// each block ten contiguous code points starting at its zero).
+static b32 pyspace(u32 cp)
 {
-    return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\v' || c=='\f';
+    return (cp >= 9 && cp <= 13) || (cp >= 0x1C && cp <= 0x20) || cp == 0x85
+        || cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A)
+        || cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F
+        || cp == 0x3000;
 }
 
-static b32 digit(u8 c)
+static i32 decimaldigit(u32 cp)
 {
-    return c >= '0' && c <= '9';
+    static const u32 zeros[] = {
+        0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6,
+        0xC66, 0xCE6, 0xD66, 0xDE6, 0xE50, 0xED0, 0xF20, 0x1040, 0x1090,
+        0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50, 0x1BB0,
+        0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50,
+        0xABF0, 0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0,
+        0x112F0, 0x11450, 0x114D0, 0x11650, 0x116C0, 0x11730, 0x118E0,
+        0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60, 0x16AC0,
+        0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140,
+        0x1E2F0, 0x1E4F0, 0x1E950, 0x1FBF0,
+    };
+    for (iz k = 0; k < (iz)countof(zeros); k++) {
+        if (cp >= zeros[k] && cp < zeros[k] + 10) {
+            return (i32)(cp - zeros[k]);
+        }
+    }
+    return -1;
 }
 
-static Str trim(Str s)
+static u32 utf8_cp(Str s, iz i, iz n)   // the code point of a valid sequence
 {
-    while (s.len && space(s.data[0])) {
-        s = cuthead(s, 1);
+    u8  c  = s.data[i];
+    u32 cp = n == 1 ? c : n == 2 ? c & 0x1Fu : n == 3 ? c & 0x0Fu : c & 0x07u;
+    for (iz k = 1; k < n; k++) {
+        cp = cp<<6 | (s.data[i+k] & 0x3Fu);
     }
-    while (s.len && space(s.data[s.len-1])) {
-        s = cuttail(s, 1);
-    }
-    return s;
+    return cp;
 }
 
 typedef struct {
-    i64 value;
-    b32 ok;      // syntactically an integer
-    b32 toobig;  // magnitude beyond the i64 range
+    Str digits;   // normalized: no leading zeros, "0" for zero
+    i64 value;    // saturated to the i64 range
+    b32 neg;
+    b32 ok;       // int() accepts the text
+    b32 toobig;   // magnitude beyond the i64 range
 } IntParsed;
 
-// Python int() semantics: optional sign, optional surrounding whitespace.
-static IntParsed parseint(Str s)
+// Python's int(str): surrounding whitespace, an optional sign, then digits
+// (any script) with single underscores between them.  Past 4300 digits
+// Python refuses, and so do we.
+static IntParsed parseint(Arena *a, Str s)
 {
     IntParsed r = {};
-    Str t = trim(s);
-    if (!t.len) {
-        return r;
-    }
-    iz  i   = 0;
-    b32 neg = 0;
-    if (t.data[0]=='+' || t.data[0]=='-') {
-        neg = t.data[0] == '-';
-        i++;
-    }
-    if (i >= t.len) {
-        return r;
-    }
-    for (; i < t.len; i++) {
-        if (!digit(t.data[i])) {
+    u32 *cp = new(a, s.len, u32);
+    iz   n  = 0;
+    for (iz i = 0; i < s.len;) {
+        iz k = utf8_seq(s, i);
+        if (!k) {
             return r;
         }
-        if (!r.toobig) {
-            i64 d = t.data[i] - '0';
-            if (r.value > (maxof(i64) - d)/10) {
-                r.toobig = 1;
-                r.value  = neg ? maxof(i64) : maxof(i64);
-            } else {
-                r.value = r.value*10 + d;
-            }
+        cp[n++] = utf8_cp(s, i, k);
+        i += k;
+    }
+    iz lo = 0, hi = n;
+    while (lo < hi && pyspace(cp[lo])) {
+        lo++;
+    }
+    while (hi > lo && pyspace(cp[hi-1])) {
+        hi--;
+    }
+    if (lo < hi && (cp[lo] == '+' || cp[lo] == '-')) {
+        r.neg = cp[lo] == '-';
+        lo++;
+    }
+    u8 *d     = new(a, hi - lo + 1, u8);
+    iz  nd    = 0;
+    b32 prevd = 0;   // the previous character was a digit
+    for (iz i = lo; i < hi; i++) {
+        i32 dv = decimaldigit(cp[i]);
+        if (dv >= 0) {
+            d[nd++] = (u8)('0' + dv);
+            prevd   = 1;
+        } else if (cp[i] == '_' && prevd && i + 1 < hi) {
+            prevd = 0;
+        } else {
+            return r;
         }
     }
-    if (neg && !r.toobig) {
+    if (!nd || nd > 4300 || !prevd) {
+        return r;
+    }
+    iz z = 0;
+    while (z < nd - 1 && d[z] == '0') {
+        z++;
+    }
+    r.digits = span(d + z, d + nd);
+    r.ok     = 1;
+    for (iz i = 0; i < r.digits.len; i++) {
+        i64 dd = r.digits.data[i] - '0';
+        if (!r.toobig && r.value > (maxof(i64) - dd)/10) {
+            r.toobig = 1;
+            r.value  = maxof(i64);
+        } else if (!r.toobig) {
+            r.value = r.value*10 + dd;
+        }
+    }
+    if (r.neg && !r.toobig) {
         r.value = -r.value;
     }
-    r.ok = 1;
     return r;
 }
 
@@ -438,63 +506,76 @@ static void printpad(Output *b, i64 x, iz width)
     printi64(b, x);
 }
 
-// Quotes a path the way GNU ls does on a terminal: plain names pass through,
-// anything with a character outside [A-Za-z0-9/._-] is wrapped in single
-// quotes, and control or non-ASCII bytes switch to $'...' escaping.
+// Quotes a path the way GNU ls does on a terminal (upstream's shell_escape):
+// names made only of [A-Za-z0-9%+-./:=@_,] pass through; otherwise runs of
+// printable characters go in single quotes (a quote itself as '\''), and
+// each control character (< 0x20, 0x7f, or a C1 code point) becomes its own
+// $'\n'-style segment.  Valid UTF-8 text stays as is.  A byte that is not
+// valid UTF-8 becomes a $'\xNN' segment, which the shell reads back right
+// (upstream would show it inside the quotes as a literal \xNN).
 static void printq(Output *b, Str s)
 {
-    b32 needs = 0;
-    b32 rawok = 1;
+    b32 safe = s.len > 0;
     for (iz i = 0; i < s.len; i++) {
         u8 c = s.data[i];
-        b32 safe = (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9')
-                 || c=='/' || c=='.' || c=='_' || c=='-';
-        if (!safe) {
-            needs = 1;
-            if (c < 0x20 || c >= 0x7F) {
-                rawok = 0;
-            }
-        }
+        safe &= (c>='A' && c<='Z') || (c>='a' && c<='z') || (c>='0' && c<='9')
+             || c=='%' || c=='+' || c=='-' || c=='.' || c=='/' || c==':'
+             || c=='=' || c=='@' || c=='_' || c==',';
     }
-    if (!needs) {
+    if (safe) {
         print(b, s);
         return;
     }
-    if (rawok) {
-        printu8(b, '\'');
-        for (iz i = 0; i < s.len; i++) {
-            if (s.data[i] == '\'') {
+    b32 quoted = 0;
+    for (iz i = 0; i < s.len;) {
+        iz  n  = utf8_seq(s, i);
+        u8  c  = s.data[i];
+        b32 c1 = n == 2 && c == 0xC2 && s.data[i+1] >= 0x80
+              && s.data[i+1] <= 0x9F;
+        b32 bad = !n || c < 0x20 || c == 0x7F || c1;
+        if (!bad) {
+            if (!quoted) {
+                printu8(b, '\'');
+                quoted = 1;
+            }
+            if (c == '\'') {
                 print(b, S("'\\''"));
             } else {
-                printu8(b, s.data[i]);
+                print(b, span(s.data + i, s.data + i + n));
+            }
+            i += n;
+            continue;
+        }
+        if (quoted) {
+            printu8(b, '\'');
+            quoted = 0;
+        }
+        print(b, S("$'\\"));
+        u32 cp = c1 ? s.data[i+1] : c;
+        switch (cp) {
+        case 0x07: printu8(b, 'a'); break;
+        case 0x08: printu8(b, 'b'); break;
+        case 0x09: printu8(b, 't'); break;
+        case 0x0A: printu8(b, 'n'); break;
+        case 0x0B: printu8(b, 'v'); break;
+        case 0x0C: printu8(b, 'f'); break;
+        case 0x0D: printu8(b, 'r'); break;
+        default:
+            if (!n) {
+                printu8(b, 'x');
+                printhex2(b, c);
+            } else {
+                printu8(b, (u8)('0' + (cp>>6 & 7)));
+                printu8(b, (u8)('0' + (cp>>3 & 7)));
+                printu8(b, (u8)('0' + (cp    & 7)));
             }
         }
         printu8(b, '\'');
-        return;
+        i += c1 ? 2 : (n ? n : 1);
     }
-    print(b, S("$'"));
-    for (iz i = 0; i < s.len; i++) {
-        u8 c = s.data[i];
-        switch (c) {
-        case '\n': print(b, S("\\n")); break;
-        case '\t': print(b, S("\\t")); break;
-        case '\r': print(b, S("\\r")); break;
-        case 0x07: print(b, S("\\a")); break;
-        case 0x08: print(b, S("\\b")); break;
-        case 0x0B: print(b, S("\\v")); break;
-        case 0x0C: print(b, S("\\f")); break;
-        case '\\': print(b, S("\\\\")); break;
-        case '\'': print(b, S("\\'")); break;
-        default:
-            if (c < 0x20 || c >= 0x7F) {
-                print(b, S("\\x"));
-                printhex2(b, c);
-            } else {
-                printu8(b, c);
-            }
-        }
+    if (quoted) {
+        printu8(b, '\'');
     }
-    printu8(b, '\'');
 }
 
 
@@ -542,9 +623,13 @@ static Str dirname(Str p)
     return head;
 }
 
+// Python's os.path.join of two parts; an empty tail still adds the slash.
 static Str join(Arena *a, Str head, Str tail)
 {
     if (!tail.len) {
+        if (head.len && head.data[head.len-1] != '/') {
+            return concat(a, head, S("/"));
+        }
         return clone(a, head);
     }
     if (tail.data[0] == '/') {
@@ -647,121 +732,6 @@ static Str rjoin(Arena *a, b32 rooted, Str *res, iz n, Str c)
     return span(d, e);
 }
 
-static Str realpath_(Os *os, Arena *a, Arena scratch, Str p)
-{
-    enum { MAXLINKS = 40 };
-
-    iz  cap = p.len/2 + 2;
-    Str *res = new(a, cap, Str);
-    iz  rn = 0;
-    b32 rooted = p.len && p.data[0] == '/';
-
-    // Pending components: a stack of spans.  Symlink targets push a run of
-    // components that must be processed before whatever is already pending,
-    // so runs are pushed in reverse.
-    typedef struct WNode WNode;
-    struct WNode {
-        WNode *next;
-        Str    s;
-    };
-    WNode *work = 0;
-
-    // Seed with p's components in reverse.
-    Str *seed = new(a, cap, Str);
-    iz  sn = 0;
-    for (iz i = 0; i < p.len;) {
-        while (i < p.len && p.data[i] == '/') {
-            i++;
-        }
-        iz s = i;
-        while (i < p.len && p.data[i] != '/') {
-            i++;
-        }
-        if (i > s) {
-            seed[sn++] = span(p.data + s, p.data + i);
-        }
-    }
-    for (iz k = sn; k-- > 0;) {
-        WNode *n = new(a, 1, WNode);
-        n->s    = seed[k];
-        n->next = work;
-        work    = n;
-    }
-
-    i32 links = 0;
-    while (work) {
-        WNode *w = work;
-        work = w->next;
-        Str c = w->s;
-        if (equals(c, S("."))) {
-            continue;
-        }
-        if (equals(c, S(".."))) {
-            if (rn && !equals(res[rn-1], S(".."))) {
-                rn--;
-            } else if (!rooted) {
-                affirm(rn < cap);
-                res[rn++] = c;
-            }
-            continue;
-        }
-        Str cand = rjoin(a, rooted, res, rn, c);
-        Stat st  = {};
-        if (!os_stat(os, scratch, cand, 0, &st)) {
-            affirm(rn < cap);
-            res[rn++] = c;   // nonexistent or unreadable: keep lexically
-            continue;
-        }
-        if (st.kind == KIND_LINK) {
-            Str target;
-            if (!os_readlink(os, a, cand, &target) || ++links > MAXLINKS) {
-                affirm(rn < cap);
-                res[rn++] = c;
-                continue;
-            }
-            if (target.len && target.data[0] == '/') {
-                rn = 0;
-                rooted = 1;
-            }
-            Str *push = new(a, target.len/2 + 2, Str);
-            iz pn = 0;
-            for (iz i = 0; i < target.len;) {
-                while (i < target.len && target.data[i] == '/') {
-                    i++;
-                }
-                iz s = i;
-                while (i < target.len && target.data[i] != '/') {
-                    i++;
-                }
-                if (i > s) {
-                    push[pn++] = span(target.data + s, target.data + i);
-                }
-            }
-            for (iz k = pn; k-- > 0;) {
-                WNode *n = new(a, 1, WNode);
-                n->s    = push[k];
-                n->next = work;
-                work    = n;
-            }
-            continue;
-        }
-        affirm(rn < cap);
-        res[rn++] = c;
-    }
-
-    if (rooted) {
-        Str r = rjoin(a, 1, res, rn, S(""));
-        return takehead(r, r.len - 1);   // drop the trailing separator
-    }
-    Str rel = S(".");
-    if (rn) {
-        rel = rjoin(a, 0, res, rn, S(""));
-        rel = takehead(rel, rel.len - 1);
-    }
-    Str cwd = os_getcwd(os, a);
-    return normpath(a, join(a, cwd, rel));
-}
-
 static b32 ismountpoint(Os *os, Arena scratch, Str path)
 {
     Stat s1 = {}, s2 = {};
@@ -793,87 +763,197 @@ static Str volume_of(Os *os, Arena *r, Arena scratch, Str path)
 }
 
 
-// fnmatch: case-sensitive shell globbing, * crosses '/', no escapes.
+// fnmatch.fnmatchcase, ported from Python's fnmatch.translate: * crosses
+// '/', ? and [...] work on code points (a byte that is not valid UTF-8 is
+// the lone surrogate U+DC00 + byte), no escapes, and a [ without its ] is a
+// plain [.  The pattern compiles to tokens, then matches with the classic
+// star backtracking.
 
-static iz classmatch(Str p, u8 c, b32 *m)   // p is after '['; -1 if no class
+typedef struct {
+    u32 lo, hi;
+} CRange;
+
+enum : i32 { FT_CHAR, FT_ANY, FT_STAR, FT_SET, FT_NEVER };
+
+typedef struct {
+    i32     kind;
+    u32     cp;
+    b32     neg;
+    CRange *r;
+    iz      nr;
+} FTok;
+
+static u32 *decodecps(Arena *a, Str s, iz *n)
 {
-    iz  i    = 0;
-    b32 neg  = 0;
-    b32 hit  = 0;
-    b32 first = 1;
-    *m = 0;
-    if (i < p.len && p.data[i] == '!') {
-        neg = 1;
-        i++;
+    u32 *cp = new(a, s.len + 1, u32);
+    iz   k  = 0;
+    for (iz i = 0; i < s.len;) {
+        iz m = utf8_seq(s, i);
+        cp[k++] = m ? utf8_cp(s, i, m) : 0xDC00u + s.data[i];
+        i += m ? m : 1;
     }
-    while (i < p.len) {
-        if (p.data[i] == ']' && !first) {
-            *m = hit != neg;
-            return i + 1;
-        }
-        first = 0;
-        u8 lo = p.data[i];
-        if (i+2 < p.len && p.data[i+1]=='-' && p.data[i+2] != ']') {
-            if (lo <= c && c <= p.data[i+2]) {
-                hit = 1;
-            }
-            i += 3;
-        } else {
-            if (lo == c) {
-                hit = 1;
-            }
-            i++;
-        }
-    }
-    return -1;
+    *n = k;
+    return cp;
 }
 
-static b32 fnmatch_(Str pat, Str s)
+typedef struct {
+    u32 *d;
+    iz   n;
+} Chunk;
+
+// One [...] class, from its body (the code points between the brackets).
+static FTok fnclass(Arena *a, u32 *st, iz m)
 {
-    iz pi = 0, si = 0, star = -1, mark = 0;
-    while (si < s.len) {
-        b32 hit = 0;
-        if (pi < pat.len && pat.data[pi] == '[') {
-            b32 m = 0;
-            iz adv = classmatch(cuthead(pat, pi + 1), s.data[si], &m);
-            if (adv >= 0) {
-                if (!m) {
-                    if (star < 0) {
-                        return 0;
-                    }
-                    pi  = star + 1;
-                    si  = ++mark;
-                    continue;
+    FTok t = {.kind = FT_SET};
+    b32 dash = 0;
+    for (iz i = 0; i < m; i++) {
+        dash |= st[i] == '-';
+    }
+    Chunk *ch = new(a, m + 2, Chunk);
+    iz     nc = 0;
+    if (!dash) {
+        ch[nc++] = (Chunk){st, m};
+    } else {
+        iz k = st[0] == '!' ? 2 : 1;
+        iz start = 0;
+        for (;;) {
+            iz f = -1;
+            for (iz i = k; i < m; i++) {
+                if (st[i] == '-') {
+                    f = i;
+                    break;
                 }
-                pi += adv + 1;
-                si++;
-                continue;
             }
-            // unterminated '[': literal
+            if (f < 0) {
+                break;
+            }
+            ch[nc++] = (Chunk){st + start, f - start};
+            start = f + 1;
+            k = f + 3;
         }
-        if (!hit && pi < pat.len
-            && (pat.data[pi] == '?' || pat.data[pi] == s.data[si])) {
-            hit = 1;
-            pi++;
-            si++;
-            continue;
+        if (start < m) {
+            ch[nc++] = (Chunk){st + start, m - start};
+        } else {   // the pattern ends in a hyphen: it joins the last chunk
+            u32 *d = new(a, ch[nc-1].n + 1, u32);
+            for (iz i = 0; i < ch[nc-1].n; i++) {
+                d[i] = ch[nc-1].d[i];
+            }
+            d[ch[nc-1].n] = '-';
+            ch[nc-1] = (Chunk){d, ch[nc-1].n + 1};
         }
-        if (!hit && pi < pat.len && pat.data[pi] == '*') {
-            star = pi++;
-            mark = si;
-            continue;
+        // Drop empty ranges: lo > hi removes both ends.
+        for (iz k2 = nc - 1; k2 > 0; k2--) {
+            Chunk *p = &ch[k2 - 1], *q = &ch[k2];
+            if (p->n && q->n && p->d[p->n - 1] > q->d[0]) {
+                u32 *d = new(a, p->n + q->n, u32);
+                iz   n = 0;
+                for (iz i = 0; i < p->n - 1; i++) d[n++] = p->d[i];
+                for (iz i = 1; i < q->n; i++)     d[n++] = q->d[i];
+                *p = (Chunk){d, n};
+                for (iz i = k2; i + 1 < nc; i++) {
+                    ch[i] = ch[i + 1];
+                }
+                nc--;
+            }
         }
-        if (star >= 0) {
-            pi  = star + 1;
-            si  = ++mark;
-            continue;
+    }
+    iz total = nc ? nc - 1 : 0;   // the hyphens between chunks
+    for (iz i = 0; i < nc; i++) {
+        total += ch[i].n;
+    }
+    if (!total) {
+        t.kind = FT_NEVER;
+        return t;
+    }
+    if (nc && ch[0].n && ch[0].d[0] == '!') {
+        if (total == 1) {
+            t.kind = FT_ANY;
+            return t;
         }
+        t.neg = 1;
+        ch[0].d++;
+        ch[0].n--;
+    }
+    t.r = new(a, total + 1, CRange);
+    for (iz i = 0; i < nc; i++) {
+        for (iz k2 = 0; k2 < ch[i].n; k2++) {
+            t.r[t.nr++] = (CRange){ch[i].d[k2], ch[i].d[k2]};
+        }
+        if (i && ch[i-1].n && ch[i].n) {
+            t.r[t.nr++] = (CRange){ch[i-1].d[ch[i-1].n - 1], ch[i].d[0]};
+        }
+    }
+    return t;
+}
+
+static b32 fnsingle(FTok *t, u32 c)
+{
+    switch (t->kind) {
+    case FT_ANY:
+        return 1;
+    case FT_CHAR:
+        return t->cp == c;
+    case FT_SET: {
+        b32 hit = 0;
+        for (iz i = 0; i < t->nr && !hit; i++) {
+            hit = t->r[i].lo <= c && c <= t->r[i].hi;
+        }
+        return hit != t->neg;
+    }
+    default:
         return 0;
     }
-    while (pi < pat.len && pat.data[pi] == '*') {
-        pi++;
+}
+
+static b32 fnmatch_(Arena scratch, Str pat, Str name)
+{
+    iz   np, nn;
+    u32 *p = decodecps(&scratch, pat, &np);
+    u32 *x = decodecps(&scratch, name, &nn);
+    FTok *t = new(&scratch, np + 1, FTok);
+    iz   nt = 0;
+    for (iz i = 0; i < np;) {
+        u32 c = p[i++];
+        if (c == '*') {
+            if (!nt || t[nt-1].kind != FT_STAR) {
+                t[nt++] = (FTok){.kind = FT_STAR};
+            }
+        } else if (c == '?') {
+            t[nt++] = (FTok){.kind = FT_ANY};
+        } else if (c == '[') {
+            iz j = i;
+            if (j < np && p[j] == '!') j++;
+            if (j < np && p[j] == ']') j++;
+            while (j < np && p[j] != ']') j++;
+            if (j >= np) {
+                t[nt++] = (FTok){.kind = FT_CHAR, .cp = '['};
+            } else {
+                t[nt++] = fnclass(&scratch, p + i, j - i);
+                i = j + 1;
+            }
+        } else {
+            t[nt++] = (FTok){.kind = FT_CHAR, .cp = c};
+        }
     }
-    return pi == pat.len;
+    iz ti = 0, xi = 0, st = -1, sx = 0;
+    while (xi < nn) {
+        if (ti < nt && t[ti].kind != FT_STAR && fnsingle(&t[ti], x[xi])) {
+            ti++;
+            xi++;
+        } else if (ti < nt && t[ti].kind == FT_STAR) {
+            st = ti++;
+            sx = xi;
+        } else if (st >= 0) {
+            ti = st + 1;
+            xi = ++sx;
+        } else {
+            return 0;
+        }
+    }
+    while (ti < nt && t[ti].kind == FT_STAR) {
+        ti++;
+    }
+    return ti == nt;
 }
 
 
@@ -979,6 +1059,61 @@ static b32 valid_utf8(Str s)
     return 1;
 }
 
+// Python's UnicodeDecodeError text for the first invalid byte of s, or a
+// null Str when s is valid UTF-8 (how a trashinfo that open().read() cannot
+// decode is reported).
+static Str utf8_error(Arena *a, Str s)
+{
+    for (iz i = 0; i < s.len;) {
+        iz n = utf8_seq(s, i);
+        if (n) {
+            i += n;
+            continue;
+        }
+        u8  c    = s.data[i];
+        iz  end  = i + 1;   // one past the offending bytes
+        Str why  = S("invalid start byte");
+        iz  need = c >= 0xF0 && c <= 0xF4 ? 3
+                 : c >= 0xE0 && c <= 0xEF ? 2
+                 : c >= 0xC2 && c <= 0xDF ? 1 : 0;
+        if (need) {
+            why = S("unexpected end of data");
+            end = s.len;
+            u8 lo = 0x80, hi = 0xBF;
+            if (c == 0xE0) lo = 0xA0;
+            if (c == 0xED) hi = 0x9F;
+            if (c == 0xF0) lo = 0x90;
+            if (c == 0xF4) hi = 0x8F;
+            for (iz k = 1; k <= need && i + k < s.len; k++) {
+                u8  b  = s.data[i+k];
+                b32 ok = k == 1 ? b >= lo && b <= hi : (b & 0xC0) == 0x80;
+                if (!ok) {
+                    why = S("invalid continuation byte");
+                    end = i + k;
+                    break;
+                }
+            }
+        }
+        Str m = S("'utf-8' codec can't decode ");
+        if (end - i == 1) {
+            Str h = {.data = new(a, 2, u8), .len = 2};
+            h.data[0] = (u8)"0123456789abcdef"[c>>4];
+            h.data[1] = (u8)"0123456789abcdef"[c&15];
+            m = concat(a, concat(a, m, S("byte 0x")), h);
+            m = concat(a, m, S(" in position "));
+            m = concat(a, m, istr(a, i));
+        } else {
+            m = concat(a, m, S("bytes in position "));
+            m = concat(a, m, istr(a, i));
+            m = concat(a, m, S("-"));
+            m = concat(a, m, istr(a, end - 1));
+        }
+        m = concat(a, m, S(": "));
+        return concat(a, m, why);
+    }
+    return (Str){};
+}
+
 
 // Dates
 
@@ -1008,67 +1143,165 @@ static i64 datetime_key(DateTime t)
          + (i64)t.hour*3600 + (i64)t.min*60 + t.sec;
 }
 
-static b32 parseu(u8 *s, iz len, iz *i, iz maxdigits, i32 *out)
+// datetime.strptime(text, "%Y-%m-%dT%H:%M:%S"), the way CPython's _strptime
+// reads it: a regex per field tried in order with backtracking (so " 5" is a
+// day, a 't' passes for the 'T', and any Unicode decimal digit passes where
+// the regex has \d), the first match must end at the end of the text, and
+// the numbers must then make a valid datetime (year 1..9999, seconds 0..59).
+enum : i32 { DF_Y, DF_MON, DF_D, DF_H, DF_MIN, DF_S, DF_COUNT };
+
+static b32 x_is(u32 *x, iz n, iz i, u32 c)
 {
-    iz  beg = *i;
-    iz  n   = 0;
-    i32 v   = 0;
-    while (*i < len && n < maxdigits && digit(s[*i])) {
-        v = v*10 + (s[*i] - '0');
-        (*i)++;
-        n++;
-    }
-    if (!n) {
-        return 0;
-    }
-    *out = v;
-    affirm(*i > beg);
-    return 1;
+    return i < n && x[i] == c;
 }
 
-// Exactly "YYYY-MM-DDTHH:MM:SS" with Python strptime leniency: the year is
-// exactly four digits, the other fields one or two.  Nothing may follow.
+static i32 dfdigit(u32 *x, iz n, iz i)   // \d: a Unicode decimal digit
+{
+    return i < n ? decimaldigit(x[i]) : -1;
+}
+
+static b32 dfin(u32 *x, iz n, iz i, u32 lo, u32 hi)   // [lo-hi], ASCII
+{
+    return i < n && x[i] >= lo && x[i] <= hi;
+}
+
+// The alternatives of one field at x[i], in the regex's order: lengths and
+// values.  Returns how many.
+static iz dfalts(i32 f, u32 *x, iz n, iz i, iz *len, i32 *val)
+{
+    iz k = 0;
+    i32 d0 = dfdigit(x, n, i), d1 = dfdigit(x, n, i + 1);
+    i32 a0 = dfin(x, n, i, '0', '9') ? (i32)(x[i] - '0') : -1;
+    i32 a1 = dfin(x, n, i + 1, '0', '9') ? (i32)(x[i+1] - '0') : -1;
+    switch (f) {
+    case DF_D:   // 3[0-1] | [1-2]\d | 0[1-9] | [1-9] | ' '[1-9]
+        if (x_is(x, n, i, '3') && dfin(x, n, i + 1, '0', '1')) {
+            len[k] = 2; val[k++] = 30 + a1;
+        }
+        if (dfin(x, n, i, '1', '2') && d1 >= 0) {
+            len[k] = 2; val[k++] = a0 * 10 + d1;
+        }
+        if (x_is(x, n, i, '0') && dfin(x, n, i + 1, '1', '9')) {
+            len[k] = 2; val[k++] = a1;
+        }
+        if (dfin(x, n, i, '1', '9')) {
+            len[k] = 1; val[k++] = a0;
+        }
+        if (x_is(x, n, i, ' ') && dfin(x, n, i + 1, '1', '9')) {
+            len[k] = 2; val[k++] = a1;
+        }
+        break;
+    case DF_MON:   // 1[0-2] | 0[1-9] | [1-9]
+        if (x_is(x, n, i, '1') && dfin(x, n, i + 1, '0', '2')) {
+            len[k] = 2; val[k++] = 10 + a1;
+        }
+        if (x_is(x, n, i, '0') && dfin(x, n, i + 1, '1', '9')) {
+            len[k] = 2; val[k++] = a1;
+        }
+        if (dfin(x, n, i, '1', '9')) {
+            len[k] = 1; val[k++] = a0;
+        }
+        break;
+    case DF_H:   // 2[0-3] | [0-1]\d | \d
+        if (x_is(x, n, i, '2') && dfin(x, n, i + 1, '0', '3')) {
+            len[k] = 2; val[k++] = 20 + a1;
+        }
+        if (dfin(x, n, i, '0', '1') && d1 >= 0) {
+            len[k] = 2; val[k++] = a0 * 10 + d1;
+        }
+        if (d0 >= 0) {
+            len[k] = 1; val[k++] = d0;
+        }
+        break;
+    case DF_MIN:   // [0-5]\d | \d
+        if (dfin(x, n, i, '0', '5') && d1 >= 0) {
+            len[k] = 2; val[k++] = a0 * 10 + d1;
+        }
+        if (d0 >= 0) {
+            len[k] = 1; val[k++] = d0;
+        }
+        break;
+    case DF_S:   // 6[0-1] | [0-5]\d | \d
+        if (x_is(x, n, i, '6') && dfin(x, n, i + 1, '0', '1')) {
+            len[k] = 2; val[k++] = 60 + a1;
+        }
+        if (dfin(x, n, i, '0', '5') && d1 >= 0) {
+            len[k] = 2; val[k++] = a0 * 10 + d1;
+        }
+        if (d0 >= 0) {
+            len[k] = 1; val[k++] = d0;
+        }
+        break;
+    }
+    return k;
+}
+
+// Matches the rest of the format from field f at x[i]; the end of the match
+// goes in *end.  The literal after each field is part of the backtracking.
+static b32 dfmatch(i32 f, u32 *x, iz n, iz i, i32 *v, iz *end)
+{
+    static const u32 lit[DF_COUNT] = {'-', '-', 'T', ':', ':', 0};
+    if (f == DF_Y) {
+        for (iz k = 0; k < 4; k++) {
+            i32 d = dfdigit(x, n, i + k);
+            if (d < 0) {
+                return 0;
+            }
+            v[DF_Y] = v[DF_Y]*10 + d;
+        }
+        i += 4;
+        if (!x_is(x, n, i, '-')) {
+            return 0;
+        }
+        return dfmatch(DF_MON, x, n, i + 1, v, end);
+    }
+    iz  len[5];
+    i32 val[5];
+    iz  na = dfalts(f, x, n, i, len, val);
+    for (iz a = 0; a < na; a++) {
+        iz j = i + len[a];
+        v[f] = val[a];
+        if (f == DF_S) {
+            *end = j;
+            return 1;
+        }
+        b32 ok = lit[f] == 'T' ? j < n && (x[j] == 'T' || x[j] == 't')
+                               : x_is(x, n, j, lit[f]);
+        if (ok && dfmatch(f + 1, x, n, j + 1, v, end)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static b32 parse_datetime(Str s, DateTime *out)
 {
-    u8 *d = s.data;
-    iz  i = 0;
-    i32 v[6];
-    if (!parseu(d, s.len, &i, 4, &v[0]) || i != 4) {
+    u32 x[32];
+    iz  n = 0;
+    for (iz i = 0; i < s.len; n++) {
+        if (n == countof(x)) {
+            return 0;   // longer than any match
+        }
+        iz k = utf8_seq(s, i);
+        x[n] = k ? utf8_cp(s, i, k) : 0xDC00u + s.data[i];
+        i += k ? k : 1;
+    }
+    i32 v[DF_COUNT] = {};
+    iz  end = 0;
+    if (!dfmatch(DF_Y, x, n, 0, v, &end) || end != n) {
         return 0;
     }
-    if (i >= s.len || d[i++] != '-') {
+    if (v[DF_Y] < 1 || v[DF_MON] < 1 || v[DF_MON] > 12 || v[DF_D] < 1
+        || v[DF_D] > days_in_month(v[DF_Y], v[DF_MON]) || v[DF_H] > 23
+        || v[DF_MIN] > 59 || v[DF_S] > 59) {
         return 0;
     }
-    if (!parseu(d, s.len, &i, 2, &v[1]) || i >= s.len || d[i++] != '-') {
-        return 0;
-    }
-    if (!parseu(d, s.len, &i, 2, &v[2]) || i >= s.len || d[i++] != 'T') {
-        return 0;
-    }
-    if (!parseu(d, s.len, &i, 2, &v[3]) || i >= s.len || d[i++] != ':') {
-        return 0;
-    }
-    if (!parseu(d, s.len, &i, 2, &v[4]) || i >= s.len || d[i++] != ':') {
-        return 0;
-    }
-    if (!parseu(d, s.len, &i, 2, &v[5]) || i != s.len) {
-        return 0;
-    }
-    if (v[1] < 1 || v[1] > 12) {
-        return 0;
-    }
-    if (v[2] < 1 || v[2] > days_in_month(v[0], v[1])) {
-        return 0;
-    }
-    if (v[3] > 23 || v[4] > 59 || v[5] > 59) {
-        return 0;
-    }
-    out->year  = v[0];
-    out->month = v[1];
-    out->day   = v[2];
-    out->hour  = v[3];
-    out->min   = v[4];
-    out->sec   = v[5];
+    out->year  = v[DF_Y];
+    out->month = v[DF_MON];
+    out->day   = v[DF_D];
+    out->hour  = v[DF_H];
+    out->min   = v[DF_MIN];
+    out->sec   = v[DF_S];
     return 1;
 }
 
@@ -1174,10 +1407,7 @@ static b32 readline(Os *os, LineReader *r, Arena *a, Str *out)
         }
     }
     if (s.len && s.data[s.len-1] == '\n') {
-        s = cuttail(s, 1);
-    }
-    if (s.len && s.data[s.len-1] == '\r') {
-        s = cuttail(s, 1);
+        s = cuttail(s, 1);   // like input(): a carriage return stays
     }
     *out = s;
     return 1;
@@ -1225,26 +1455,164 @@ static void prefixes(Ctx *c, Output *b, Str msg)
     say(c, b, msg);
 }
 
-static Str istr(Arena *a, i64 x)
-{
-    u8  buf[32];
-    u8 *end = buf + countof(buf);
-    u8 *beg = end;
-    i64 t   = x < 0 ? x : -x;
-    do {
-        *--beg = (u8)('0' - (i32)(t%10));
-    } while (t /= 10);
-    if (x < 0) {
-        *--beg = '-';
-    }
-    return clone(a, span(beg, end));
-}
-
 // lexists: a dangling symlink exists, like Python's os.path.lexists.
 static b32 lexists(Os *os, Arena scratch, Str path)
 {
     Stat st = {};
     return os_stat(os, scratch, path, 0, &st);
+}
+
+
+// Pushes one resolved component, doubling the stack in *a when it is full:
+// symlink targets can add arbitrarily many components beyond the path's own.
+static void rpush(Arena *a, Str **res, iz *cap, iz *rn, Str c)
+{
+    if (*rn == *cap) {
+        Str *grown = new(a, *cap*2, Str);
+        for (iz k = 0; k < *rn; k++) {
+            grown[k] = (*res)[k];
+        }
+        *res = grown;
+        *cap *= 2;
+    }
+    (*res)[(*rn)++] = c;
+}
+
+// The cwd, or the command's failure when it cannot be read (a deleted
+// working directory), as os.getcwd() raising ends upstream.
+static Str cwd_or_die(Ctx *c, Arena *a)
+{
+    Str cwd = os_getcwd(c->os, a);
+    if (!cwd.data) {
+        i32 err = os_errno(c->os);
+        Str m = concat(a, S("[Errno "), istr(a, err));
+        m = concat(a, m, S("] "));
+        die(c, 1, concat(a, m, os_strerror(c->os, err)));
+    }
+    return cwd;
+}
+
+// Python's os.path.realpath: symlinks resolved, nonexistent tails kept as
+// given.  A relative path needs the cwd; without one the command fails, as
+// os.getcwd() raising would.
+static Str realpath_(Ctx *c, Arena *a, Arena scratch, Str p)
+{
+    enum { MAXLINKS = 40 };
+    Os *os = c->os;
+
+    iz  cap = p.len/2 + 2;
+    Str *res = new(a, cap, Str);
+    iz  rn = 0;
+    b32 rooted = p.len && p.data[0] == '/';
+
+    // Pending components: a stack of spans.  Symlink targets push a run of
+    // components that must be processed before whatever is already pending,
+    // so runs are pushed in reverse.
+    typedef struct WNode WNode;
+    struct WNode {
+        WNode *next;
+        Str    s;
+    };
+    WNode *work = 0;
+
+    // Seed with p's components in reverse.
+    Str *seed = new(a, cap, Str);
+    iz  sn = 0;
+    for (iz i = 0; i < p.len;) {
+        while (i < p.len && p.data[i] == '/') {
+            i++;
+        }
+        iz s = i;
+        while (i < p.len && p.data[i] != '/') {
+            i++;
+        }
+        if (i > s) {
+            seed[sn++] = span(p.data + s, p.data + i);
+        }
+    }
+    for (iz k = sn; k-- > 0;) {
+        WNode *n = new(a, 1, WNode);
+        n->s    = seed[k];
+        n->next = work;
+        work    = n;
+    }
+
+    i32 links = 0;
+    while (work) {
+        WNode *w = work;
+        work = w->next;
+        Str c = w->s;
+        if (equals(c, S("."))) {
+            continue;
+        }
+        if (equals(c, S(".."))) {
+            if (rn && !equals(res[rn-1], S(".."))) {
+                rn--;
+            } else if (!rooted) {
+                rpush(a, &res, &cap, &rn, c);
+            }
+            continue;
+        }
+        Str cand = rjoin(a, rooted, res, rn, c);
+        Stat st  = {};
+        if (!os_stat(os, scratch, cand, 0, &st)) {
+            rpush(a, &res, &cap, &rn, c);   // nonexistent: keep lexically
+            continue;
+        }
+        if (st.kind == KIND_LINK) {
+            Str target;
+            if (!os_readlink(os, a, cand, &target) || ++links > MAXLINKS) {
+                rpush(a, &res, &cap, &rn, c);
+                continue;
+            }
+            if (target.len && target.data[0] == '/') {
+                rn = 0;
+                rooted = 1;
+            }
+            Str *push = new(a, target.len/2 + 2, Str);
+            iz pn = 0;
+            for (iz i = 0; i < target.len;) {
+                while (i < target.len && target.data[i] == '/') {
+                    i++;
+                }
+                iz s = i;
+                while (i < target.len && target.data[i] != '/') {
+                    i++;
+                }
+                if (i > s) {
+                    push[pn++] = span(target.data + s, target.data + i);
+                }
+            }
+            for (iz k = pn; k-- > 0;) {
+                WNode *n = new(a, 1, WNode);
+                n->s    = push[k];
+                n->next = work;
+                work    = n;
+            }
+            continue;
+        }
+        rpush(a, &res, &cap, &rn, c);
+    }
+
+    if (rooted) {
+        Str r = rjoin(a, 1, res, rn, S(""));
+        return takehead(r, r.len - 1);   // drop the trailing separator
+    }
+    Str rel = S(".");
+    if (rn) {
+        rel = rjoin(a, 0, res, rn, S(""));
+        rel = takehead(rel, rel.len - 1);
+    }
+    return normpath(a, join(a, cwd_or_die(c, a), rel));
+}
+
+// os.path.abspath: a relative path joins the cwd; absolute ones need none.
+static Str abspath_(Ctx *c, Arena *a, Str p)
+{
+    if (p.len && p.data[0] == '/') {
+        return normpath(a, p);
+    }
+    return normpath(a, join(a, cwd_or_die(c, a), p));
 }
 
 
@@ -1257,6 +1625,7 @@ typedef struct {
     DateTime date;
     b32      has_date;
     Str      infopath;
+    Str      why;         // TI_BADUTF8: Python's decode error text
 } TrashInfo;
 
 // Reads and parses one .trashinfo file.  Only the first Path= and the first
@@ -1274,18 +1643,24 @@ static TrashInfo trashinfo_read(Ctx *c, Arena *a, Arena, Str infopath,
         return ti;
     }
     if (!valid_utf8(content)) {
+        ti.why  = utf8_error(a, content);
         *status = TI_BADUTF8;
         return ti;
     }
     b32 dated = 0;
     Str rest  = content;
     while (rest.len) {
-        Cut lc   = cut(rest, '\n');
-        Str line = lc.head;
-        rest     = lc.tail;
-        if (line.len && line.data[line.len-1] == '\r') {
-            line = cuttail(line, 1);
+        // Text-mode reading: \r\n and a lone \r end a line like \n does.
+        iz k = 0;
+        for (; k < rest.len && rest.data[k] != '\n' && rest.data[k] != '\r';
+             k++) {}
+        Str line = takehead(rest, k);
+        iz  skip = k < rest.len ? 1 : 0;
+        if (k + 1 < rest.len && rest.data[k] == '\r'
+            && rest.data[k+1] == '\n') {
+            skip = 2;
         }
+        rest = cuthead(rest, k + skip);
         if (!ti.path.data && startswith(line, S("Path="))) {
             ti.path = percentdecode(a, cuthead(line, 5));
         } else if (!dated && startswith(line, S("DeletionDate="))) {
@@ -1315,31 +1690,112 @@ static Str fmt_date(Arena *a, DateTime t)   // "YYYY-MM-DD HH:MM:SS"
 }
 
 
-// Option parser (argparse emulation)
-//
-// Long options match exactly or by unambiguous prefix; values may be given
-// as --opt VALUE or --opt=VALUE.  Short options may be clustered (-vv).
-// Everything after -- is positional.  A lone - and arguments that look like
-// negative numbers are positional too.  Positionals must form one contiguous
-// run: any positional that follows an option, and any option nobody claims,
-// is reported as unrecognized.  -h/--help, --version and --print-completion
-// act the moment they are seen, like argparse actions.
+// The first n characters of s, counting each invalid byte as one character
+// (Python's surrogateescape view of a file name); n may exceed the length.
+static Str takechars(Str s, iz n)
+{
+    iz i = 0;
+    for (; n > 0 && i < s.len; n--) {
+        iz k = utf8_seq(s, i);
+        i += k ? k : 1;
+    }
+    return takehead(s, i);
+}
 
-enum : u8 { ACT_NONE = 0, ACT_HELP, ACT_VERSION, ACT_COMPLETION };
+static iz countchars(Str s)
+{
+    iz n = 0;
+    for (iz i = 0; i < s.len; n++) {
+        iz k = utf8_seq(s, i);
+        i += k ? k : 1;
+    }
+    return n;
+}
+
+// Python's repr() of a str, as it shows inside upstream's warning texts.
+static Str pyrepr(Arena *a, Str s)
+{
+    b32 sq = 0, dq = 0;
+    for (iz i = 0; i < s.len; i++) {
+        sq |= s.data[i] == '\'';
+        dq |= s.data[i] == '"';
+    }
+    u8  q = sq && !dq ? '"' : '\'';
+    Str r = {.data = new(a, 0, u8)};
+    r = concat(a, r, (Str){&q, 1});
+    for (iz i = 0; i < s.len;) {
+        iz n = utf8_seq(s, i);
+        u8 c = s.data[i];
+        if (!n) {
+            u8 esc[6] = {'\\', 'u', 'd', 'c',
+                         (u8)"0123456789abcdef"[c>>4],
+                         (u8)"0123456789abcdef"[c&15]};
+            r = concat(a, r, (Str){esc, 6});
+            i++;
+        } else if (c == q || c == '\\') {
+            u8 esc[2] = {'\\', c};
+            r = concat(a, r, (Str){esc, 2});
+            i++;
+        } else if (c == '\n' || c == '\r' || c == '\t') {
+            u8 esc[2] = {'\\', c == '\n' ? 'n' : c == '\r' ? 'r' : 't'};
+            r = concat(a, r, (Str){esc, 2});
+            i++;
+        } else if (c < 0x20 || c == 0x7F) {
+            u8 esc[4] = {'\\', 'x', (u8)"0123456789abcdef"[c>>4],
+                         (u8)"0123456789abcdef"[c&15]};
+            r = concat(a, r, (Str){esc, 4});
+            i++;
+        } else {
+            r = concat(a, r, span(s.data + i, s.data + i + n));
+            i += n;
+        }
+    }
+    return concat(a, r, (Str){&q, 1});
+}
+
+
+// Argument parsing: Python 3.12's argparse, as these commands use it
+//
+// A command describes its parser as data (Parser, Arg), the arguments in
+// upstream's registration order.  ap_parse follows argparse's own algorithm:
+// every argument is classified into an O/A/- pattern (an option, a plain
+// argument, the first --), then positionals and optionals are consumed in
+// turn, so errors surface in the same order and with the same words.
+// ap_usage and ap_help follow HelpFormatter and wrap to $COLUMNS (or the
+// terminal, or 80) minus two.
+
+enum : i32 { AK_STORE, AK_FLAG, AK_COUNT, AK_APPEND, AK_HELP, AK_VERSION,
+             AK_COMPLETION };
+enum : i32 { NA_ONE, NA_ZERO, NA_OPT, NA_STAR };
 
 typedef struct {
-    Str name;        // long name without the leading dashes
-    Str shorts;      // short option characters, e.g. S("rR"); empty if none
-    b32 value;       // takes a value
-    Str choices[8];  // allowed values, when the value is enumerated
+    Str opts[4];      // option strings, empty for a positional
+    iz  nopts;
+    Str metavar;      // shown for a value (positionals always have one)
+    Str choices[4];
     iz  nchoices;
-    u8  action;
-} OptSpec;
+    i32 kind;
+    i32 nargs;
+    b32 isint;        // type=int
+    Str help;         // null: no help text
+    b32 hidden;       // help=SUPPRESS
+    Str defshow;      // ArgumentDefaultsHelpFormatter's "(default: ...)"
+} Arg;
+
+typedef struct {
+    Str  usage;       // explicit usage text, else computed
+    Str  description;
+    Str  epilog;
+    b32  rawdesc;     // RawDescriptionHelpFormatter
+    b32  defaults;    // ArgumentDefaultsHelpFormatter
+    Arg *args;
+    iz   nargs;
+} Parser;
 
 typedef struct OptVal OptVal;
 struct OptVal {
     OptVal *next;
-    i32     id;     // index into the command's OptSpec table
+    i32     id;     // index into the command's Arg table
     Str     val;
 };
 
@@ -1347,29 +1803,7 @@ typedef struct {
     OptVal *vals;    // in command-line order
     Str    *pos;     // positional arguments
     iz      npos;
-    Str    *extras;  // unrecognized arguments, in order
-    iz      nextras;
 } ParsedOpts;
-
-typedef struct {
-    Ctx *ctx;
-    Str  usage;         // error preamble, without trailing newline
-    Str  help_usage;    // the usage line --help prints first, blank line after
-    Str  help_body;     // the rest of the help text
-    b32  bare_version;  // put personas print a bare version string
-} OptEnv;
-
-[[noreturn]] static void die_usage(OptEnv *e, Str msg)
-{
-    Ctx *c = e->ctx;
-    print(c->err, e->usage);
-    print(c->err, S("\n"));
-    print(c->err, c->prog);
-    print(c->err, S(": error: "));
-    print(c->err, msg);
-    print(c->err, S("\n"));
-    finish(c, 2);
-}
 
 static b32 optgiven(ParsedOpts *p, i32 id)
 {
@@ -1414,229 +1848,1021 @@ static Str optval(ParsedOpts *p, i32 id, iz k)
     return (Str){};
 }
 
-static void printchoices(OptEnv *e, OptSpec *sp, Str value)
+// -- text wrapping (textwrap.wrap, for the help strings) -----------------
+
+static Str collapse(Arena *a, Str s)   // \s+ -> " ", stripped
 {
-    Ctx *c = e->ctx;
-    print(c->err, S("argument --"));
-    print(c->err, sp->name);
-    print(c->err, S(": invalid choice: '"));
-    print(c->err, value);
-    print(c->err, S("' (choose from"));
-    for (iz k = 0; k < sp->nchoices; k++) {
-        print(c->err, k ? S(", ") : S(" "));
-        print(c->err, S("'"));
-        print(c->err, sp->choices[k]);
-        print(c->err, S("'"));
+    Str r = {.data = new(a, 0, u8)};
+    b32 gap = 0;
+    for (iz i = 0; i < s.len; i++) {
+        u8 c = s.data[i];
+        if (c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\f' || c=='\v') {
+            gap = r.len > 0;
+        } else {
+            if (gap) {
+                r = concat(a, r, S(" "));
+                gap = 0;
+            }
+            r = concat(a, r, (Str){&c, 1});
+        }
     }
-    print(c->err, S(")\n"));
+    return r;
+}
+
+static b32 isletter(u8 c)
+{
+    return (c>='A' && c<='Z') || (c>='a' && c<='z') || c=='_' || c>=0x80;
+}
+
+static b32 isword(u8 c)
+{
+    return isletter(c) || (c>='0' && c<='9');
+}
+
+static b32 iswordpunct(u8 c)
+{
+    return isword(c) || c=='!' || c=='"' || c=='\'' || c=='&' || c=='.'
+        || c==',' || c=='?';
+}
+
+// -{2,} followed by a word character, starting at t[k]
+static b32 emdash(Str t, iz k)
+{
+    iz j = k;
+    while (j < t.len && t.data[j] == '-') {
+        j++;
+    }
+    return j - k >= 2 && j < t.len && isword(t.data[j]);
+}
+
+// A hyphen at t[k] that textwrap may break after: two letters, or
+// letter-hyphen-letter, before it, and letter, optional hyphen, letter after.
+static b32 hyphenbreak(Str t, iz k)
+{
+    b32 behind = (k >= 2 && isletter(t.data[k-2]) && isletter(t.data[k-1]))
+              || (k >= 3 && isletter(t.data[k-3]) && t.data[k-2]=='-'
+                  && isletter(t.data[k-1]));
+    if (!behind || k + 2 >= t.len || !isletter(t.data[k+1])) {
+        return 0;
+    }
+    return isletter(t.data[k+2])
+        || (t.data[k+2] == '-' && k + 3 < t.len && isletter(t.data[k+3]));
+}
+
+// textwrap's wordsep_re: words (split after some hyphens and before
+// em-dashes) and single spaces.
+static iz wordchunks(Arena *a, Str t, Str **out)
+{
+    Str *ch = new(a, t.len + 1, Str);
+    iz   n  = 0;
+    for (iz i = 0; i < t.len;) {
+        if (t.data[i] == ' ') {
+            ch[n++] = span(t.data + i, t.data + i + 1);
+            i++;
+            continue;
+        }
+        if (t.data[i] == '-' && i > 0 && iswordpunct(t.data[i-1])
+            && emdash(t, i)) {
+            iz k = i;
+            while (k < t.len && t.data[k] == '-') {
+                k++;
+            }
+            ch[n++] = span(t.data + i, t.data + k);
+            i = k;
+            continue;
+        }
+        iz k = i + 1;
+        for (; k < t.len && t.data[k] != ' '; k++) {
+            if (t.data[k] == '-' && hyphenbreak(t, k)) {
+                k++;
+                break;
+            }
+            if (iswordpunct(t.data[k-1]) && emdash(t, k)) {
+                break;
+            }
+        }
+        ch[n++] = span(t.data + i, t.data + k);
+        i = k;
+    }
+    *out = ch;
+    return n;
+}
+
+// textwrap.wrap(text, width): the lines, in *out.
+static iz wraplines(Arena *a, Str text, iz width, Str **out)
+{
+    Str  t  = collapse(a, text);
+    Str *ch;
+    iz   nc = wordchunks(a, t, &ch);
+    Str *lines = new(a, nc + t.len + 2, Str);
+    iz   nl = 0;
+    for (iz ci = 0; ci < nc;) {
+        Str line = {.data = new(a, 0, u8)};
+        iz  cur  = 0;
+        b32 lastspace = 0;
+        if (nl > 0 && ch[ci].len == 1 && ch[ci].data[0] == ' ') {
+            ci++;
+        }
+        while (ci < nc) {
+            iz l = countchars(ch[ci]);
+            if (cur + l > width) {
+                break;
+            }
+            line = concat(a, line, ch[ci]);
+            lastspace = ch[ci].len == 1 && ch[ci].data[0] == ' ';
+            cur += l;
+            ci++;
+        }
+        if (ci < nc && countchars(ch[ci]) > width) {   // a word too long
+            iz  left  = width < 1 ? 1 : width - cur;
+            Str chunk = ch[ci];
+            iz  end   = left;
+            if (countchars(chunk) > left) {
+                iz h = -1;   // chunk.rfind('-', 0, left)
+                for (iz k = 0; k < left && k < chunk.len; k++) {
+                    if (chunk.data[k] == '-') {
+                        h = k;
+                    }
+                }
+                b32 other = 0;
+                for (iz k = 0; k < h; k++) {
+                    other |= chunk.data[k] != '-';
+                }
+                if (h > 0 && other) {
+                    end = h + 1;
+                }
+            }
+            Str head = takechars(chunk, end);
+            line = concat(a, line, head);
+            ch[ci] = cuthead(chunk, head.len);
+            lastspace = 0;
+        }
+        if (lastspace) {
+            line = cuttail(line, 1);
+        }
+        if (line.len) {
+            lines[nl++] = line;
+        }
+    }
+    *out = lines;
+    return nl;
+}
+
+// -- HelpFormatter -------------------------------------------------------
+
+static Str ap_metavar(Arena *a, Arg *x)
+{
+    if (x->metavar.data) {
+        return x->metavar;
+    }
+    Str r = S("{");
+    for (iz k = 0; k < x->nchoices; k++) {
+        r = concat(a, r, k ? S(",") : S(""));
+        r = concat(a, r, x->choices[k]);
+    }
+    return concat(a, r, S("}"));
+}
+
+static Str ap_fmtargs(Arena *a, Arg *x)   // _format_args
+{
+    Str m = ap_metavar(a, x);
+    switch (x->nargs) {
+    case NA_OPT:
+        return concat(a, concat(a, S("["), m), S("]"));
+    case NA_STAR:
+        return concat(a, concat(a, S("["), m), S(" ...]"));
+    default:
+        return m;
+    }
+}
+
+// How the argument is shown on the left of its help line.
+static Str ap_invocation(Arena *a, Arg *x)
+{
+    if (!x->nopts) {
+        return ap_metavar(a, x);
+    }
+    Str r = {.data = new(a, 0, u8)};
+    for (iz k = 0; k < x->nopts; k++) {
+        r = concat(a, r, k ? S(", ") : S(""));
+        r = concat(a, r, x->opts[k]);
+        if (x->nargs != NA_ZERO) {
+            r = concat(a, concat(a, r, S(" ")), ap_fmtargs(a, x));
+        }
+    }
+    return r;
+}
+
+// One argument's piece of the usage line.
+static Str ap_usagepart(Arena *a, Arg *x)
+{
+    if (!x->nopts) {
+        return ap_fmtargs(a, x);
+    }
+    Str r = x->opts[0];
+    if (x->nargs != NA_ZERO) {
+        r = concat(a, concat(a, r, S(" ")), ap_fmtargs(a, x));
+    }
+    return concat(a, concat(a, S("["), r), S("]"));
+}
+
+static Str joinparts(Arena *a, Str *parts, iz n)
+{
+    Str r = {.data = new(a, 0, u8)};
+    for (iz k = 0; k < n; k++) {
+        r = concat(a, r, k ? S(" ") : S(""));
+        r = concat(a, r, parts[k]);
+    }
+    return r;
+}
+
+// get_lines of _format_usage: parts wrapped at text_width after indent.
+static iz ap_getlines(Arena *a, Str *parts, iz n, iz indent, iz prefixlen,
+                      iz text_width, Str *lines)
+{
+    iz nl = 0;
+    Str line = {.data = new(a, 0, u8)};
+    b32 have = 0;
+    iz  line_len = prefixlen ? prefixlen - 1 : indent - 1;
+    for (iz k = 0; k < n; k++) {
+        iz plen = countchars(parts[k]);
+        if (line_len + 1 + plen > text_width && have) {
+            lines[nl++] = line;
+            line = (Str){.data = new(a, 0, u8)};
+            have = 0;
+            line_len = indent - 1;
+        }
+        line = concat(a, concat(a, line, have ? S(" ") : S("")), parts[k]);
+        have = 1;
+        line_len += plen + 1;
+    }
+    if (have) {
+        lines[nl++] = line;
+    }
+    return nl;
+}
+
+static Str spaces(Arena *a, iz n)
+{
+    Str r = {.data = new(a, 0, u8)};
+    for (iz i = 0; i < n; i++) {
+        r = concat(a, r, S(" "));
+    }
+    return r;
+}
+
+// _format_usage: "usage: ...\n\n"
+static Str ap_usage(Arena *a, Parser *p, Str prog, iz width)
+{
+    Str prefix = S("usage: ");
+    Str usage;
+    if (p->usage.data) {
+        usage = clone(a, p->usage);
+        // "%(prog)s" is the only placeholder in an explicit usage
+        Str pat = S("%(prog)s");
+        iz at = -1;
+        for (iz i = 0; i + pat.len <= usage.len; i++) {
+            if (equals(takehead(cuthead(usage, i), pat.len), pat)) {
+                at = i;
+                break;
+            }
+        }
+        if (at >= 0) {
+            Str r = concat(a, clone(a, takehead(usage, at)), prog);
+            usage = concat(a, r, cuthead(usage, at + pat.len));
+        }
+    } else {
+        Str *opt = new(a, p->nargs + 1, Str), *pos = new(a, p->nargs + 1, Str);
+        iz   no = 0, np = 0;
+        for (iz k = 0; k < p->nargs; k++) {
+            Arg *x = &p->args[k];
+            if (x->hidden) {
+                continue;
+            }
+            if (x->nopts) {
+                opt[no++] = ap_usagepart(a, x);
+            } else {
+                pos[np++] = ap_usagepart(a, x);
+            }
+        }
+        Str ou = joinparts(a, opt, no), pu = joinparts(a, pos, np);
+        Str au = concat(a, concat(a, clone(a, ou), no && np ? S(" ") : S("")),
+                        pu);
+        usage = au.len ? concat(a, concat(a, clone(a, prog), S(" ")), au)
+                       : clone(a, prog);
+        iz text_width = width;
+        if (countchars(prefix) + countchars(usage) > text_width) {
+            iz  pl = countchars(prefix);
+            iz  gl = countchars(prog);
+            Str *lines = new(a, 2*p->nargs + 8, Str);
+            iz  nl = 0;
+            if ((pl + gl) * 4 <= 3 * text_width) {   // <= 0.75 * text_width
+                iz indent = pl + gl + 1;
+                Str ind = spaces(a, indent);
+                if (no) {
+                    Str *first = new(a, no + 1, Str);
+                    first[0] = prog;
+                    for (iz k = 0; k < no; k++) {
+                        first[k + 1] = opt[k];
+                    }
+                    nl = ap_getlines(a, first, no + 1, indent, pl, text_width,
+                                     lines);
+                    // the first line carries the prefix, not the indent
+                    nl += ap_getlines(a, pos, np, indent, 0, text_width,
+                                      lines + nl);
+                    for (iz k = 1; k < nl; k++) {
+                        lines[k] = concat(a, clone(a, ind), lines[k]);
+                    }
+                } else if (np) {
+                    Str *first = new(a, np + 1, Str);
+                    first[0] = prog;
+                    for (iz k = 0; k < np; k++) {
+                        first[k + 1] = pos[k];
+                    }
+                    nl = ap_getlines(a, first, np + 1, indent, pl, text_width,
+                                     lines);
+                    for (iz k = 1; k < nl; k++) {
+                        lines[k] = concat(a, clone(a, ind), lines[k]);
+                    }
+                } else {
+                    lines[nl++] = prog;
+                }
+            } else {
+                iz  indent = pl;
+                Str ind = spaces(a, indent);
+                Str *all = new(a, no + np + 1, Str);
+                for (iz k = 0; k < no; k++) all[k] = opt[k];
+                for (iz k = 0; k < np; k++) all[no + k] = pos[k];
+                Str *tmp = new(a, 2*p->nargs + 8, Str);
+                iz  nt = ap_getlines(a, all, no + np, indent, 0, text_width,
+                                     tmp);
+                if (nt > 1) {
+                    nt = ap_getlines(a, opt, no, indent, 0, text_width, tmp);
+                    nt += ap_getlines(a, pos, np, indent, 0, text_width,
+                                      tmp + nt);
+                }
+                lines[nl++] = prog;
+                for (iz k = 0; k < nt; k++) {
+                    lines[nl++] = concat(a, clone(a, ind), tmp[k]);
+                }
+            }
+            usage = (Str){.data = new(a, 0, u8)};
+            for (iz k = 0; k < nl; k++) {
+                usage = concat(a, concat(a, usage, k ? S("\n") : S("")),
+                               lines[k]);
+            }
+        }
+    }
+    return concat(a, concat(a, clone(a, prefix), usage), S("\n\n"));
+}
+
+static Str ap_fill(Arena *a, Parser *p, Str text, iz width)   // _fill_text
+{
+    if (p->rawdesc) {
+        return text;
+    }
+    Str *lines;
+    iz   n = wraplines(a, text, width, &lines);
+    Str  r = {.data = new(a, 0, u8)};
+    for (iz k = 0; k < n; k++) {
+        r = concat(a, concat(a, r, k ? S("\n") : S("")), lines[k]);
+    }
+    return r;
+}
+
+// One argument's block in the help (_format_action), at indent 2.
+static Str ap_action(Arena *a, Parser *p, Arg *x, iz help_position,
+                     iz help_width)
+{
+    iz  indent       = 2;
+    iz  action_width = help_position - indent - 2;
+    Str header       = ap_invocation(a, x);
+    iz  hl           = countchars(header);
+    iz  indent_first = 0;
+    Str r            = spaces(a, indent);
+    if (!x->help.len) {
+        return concat(a, concat(a, r, header), S("\n"));
+    } else if (hl <= action_width) {
+        r = concat(a, r, header);
+        r = concat(a, r, spaces(a, action_width - hl));
+        r = concat(a, r, S("  "));
+    } else {
+        r = concat(a, concat(a, r, header), S("\n"));
+        indent_first = help_position;
+    }
+    Str text = x->help;
+    if (p->defaults && x->defshow.data && (x->nopts || x->nargs == NA_OPT
+                                           || x->nargs == NA_STAR)) {
+        text = concat(a, concat(a, clone(a, text), S(" (default: ")),
+                       concat(a, clone(a, x->defshow), S(")")));
+    }
+    Str *lines;
+    iz   n = wraplines(a, text, help_width, &lines);
+    for (iz k = 0; k < n; k++) {
+        r = concat(a, r, spaces(a, k ? help_position : indent_first));
+        r = concat(a, concat(a, r, lines[k]), S("\n"));
+    }
+    return r;
+}
+
+static Str ap_section(Arena *a, Parser *p, b32 positional, Str heading,
+                      iz help_position, iz help_width)
+{
+    Str items = {.data = new(a, 0, u8)};
+    for (iz k = 0; k < p->nargs; k++) {
+        Arg *x = &p->args[k];
+        if (x->hidden || (x->nopts == 0) != positional) {
+            continue;
+        }
+        items = concat(a, items, ap_action(a, p, x, help_position, help_width));
+    }
+    if (!items.len) {
+        return S("");
+    }
+    Str r = concat(a, clone(a, S("\n")), heading);
+    r = concat(a, r, S(":\n"));
+    return concat(a, concat(a, r, items), S("\n"));
+}
+
+// parser.format_help()
+static Str ap_help(Arena *a, Parser *p, Str prog, iz width)
+{
+    iz maxpos = width - 20 > 4 ? width - 20 : 4;
+    if (maxpos > 24) {
+        maxpos = 24;
+    }
+    iz maxlen = 0;
+    for (iz k = 0; k < p->nargs; k++) {
+        Arg *x = &p->args[k];
+        if (!x->hidden) {
+            iz l = countchars(ap_invocation(a, x)) + 2;
+            maxlen = l > maxlen ? l : maxlen;
+        }
+    }
+    iz help_position = maxlen + 2 < maxpos ? maxlen + 2 : maxpos;
+    iz help_width    = width - help_position > 11 ? width - help_position : 11;
+    iz text_width    = width > 11 ? width : 11;
+
+    Str r = ap_usage(a, p, prog, width);
+    if (p->description.len) {
+        r = concat(a, r, ap_fill(a, p, p->description, text_width));
+        r = concat(a, r, S("\n\n"));
+    }
+    r = concat(a, r, ap_section(a, p, 1, S("positional arguments"),
+                                help_position, help_width));
+    r = concat(a, r, ap_section(a, p, 0, S("options"), help_position,
+                                help_width));
+    if (p->epilog.len) {
+        r = concat(a, r, ap_fill(a, p, p->epilog, text_width));
+        r = concat(a, r, S("\n\n"));
+    }
+    // three or more newlines become two; the ends are stripped to one
+    Str o = {.data = new(a, 0, u8)};
+    iz  nl = 0;
+    for (iz i = 0; i < r.len; i++) {
+        nl = r.data[i] == '\n' ? nl + 1 : 0;
+        if (nl <= 2) {
+            o = concat(a, o, span(r.data + i, r.data + i + 1));
+        }
+    }
+    while (o.len && o.data[0] == '\n') {
+        o = cuthead(o, 1);
+    }
+    while (o.len && o.data[o.len-1] == '\n') {
+        o = cuttail(o, 1);
+    }
+    return concat(a, o, S("\n"));
+}
+
+// -- parsing -------------------------------------------------------------
+
+typedef struct {
+    Ctx    *c;
+    Parser *p;
+    Str     prog;
+    Arena  *a;
+} AP;
+
+// The width argparse wraps to: $COLUMNS, else the terminal's, else 80; less 2.
+static iz ap_width(Ctx *c)
+{
+    iz cols = 0;
+    Str env = os_getenv(c->os, S("COLUMNS"));
+    if (env.data) {
+        IntParsed ip = parseint(c->perm, env);
+        if (ip.ok && !ip.toobig && !ip.neg) {
+            cols = ip.value;
+        }
+    }
+    if (cols <= 0) {
+        cols = os_termwidth(c->os);
+    }
+    if (cols <= 0) {
+        cols = 80;
+    }
+    return cols - 2;
+}
+
+// parser.error(): the usage, then "<prog>: error: <message>", exit 2.
+[[noreturn]] static void ap_error(AP *ap, Str msg)
+{
+    Ctx *c = ap->c;
+    Str u = ap_usage(ap->a, ap->p, ap->prog, ap_width(c));
+    while (u.len && u.data[u.len-1] == '\n') {
+        u = cuttail(u, 1);
+    }
+    print(c->err, u);
+    print(c->err, S("\n"));
+    print(c->err, ap->prog);
+    print(c->err, S(": error: "));
+    print(c->err, msg);
+    print(c->err, S("\n"));
     finish(c, 2);
 }
 
-[[noreturn]] static void perform_action(OptEnv *e, OptSpec *sp, Str val)
+static Str ap_argname(AP *ap, Arg *x)
 {
-    Ctx *c = e->ctx;
-    switch (sp->action) {
-    case ACT_HELP:
-        print(c->out, e->help_usage);
-        print(c->out, e->help_body);
-        finish(c, 0);
-    case ACT_VERSION:
-        if (e->bare_version) {
-            print(c->out, S("0.26.9.29\n"));
-        } else {
-            print(c->out, c->prog);
-            print(c->out, S(" 0.26.9.29\n"));
-        }
-        finish(c, 0);
-    case ACT_COMPLETION:
-        for (iz k = 0; k < sp->nchoices; k++) {
-            if (equals(sp->choices[k], val)) {
-                print(c->out, S("Please install shtab firstly!\n"));
-                finish(c, 0);
-            }
-        }
-        printchoices(e, sp, val);
+    if (!x->nopts) {
+        return x->metavar;
     }
-    affirm(0);
+    Str r = {.data = new(ap->a, 0, u8)};
+    for (iz k = 0; k < x->nopts; k++) {
+        r = concat(ap->a, concat(ap->a, r, k ? S("/") : S("")), x->opts[k]);
+    }
+    return r;
 }
 
-static ParsedOpts optparse(OptEnv *e, OptSpec *specs, iz nspecs, iz nargs,
-                           iz argc, Str *argv, Arena *a)
+[[noreturn]] static void ap_argerror(AP *ap, Arg *x, Str msg)
 {
-    ParsedOpts r = {};
-    r.pos    = new(a, argc, Str);
-    r.extras = new(a, argc, Str);
-    OptVal **tail = &r.vals;
-    b32 noparse = 0;   // after --
-    b32 closed  = 0;   // the positional run ended; later positionals are extras
+    Str m = concat(ap->a, S("argument "), ap_argname(ap, x));
+    m = concat(ap->a, m, S(": "));
+    ap_error(ap, concat(ap->a, m, msg));
+}
 
+// "usage" parser.error() for the commands' own checks
+[[noreturn]] static void ap_fail(Ctx *c, Parser *p, Str msg)
+{
+    AP ap = {c, p, c->prog, c->perm};
+    ap_error(&ap, msg);
+}
+
+typedef struct {
+    Arg *arg;        // null: not an option of this parser
+    Str  ostr;       // the option string matched
+    b32  sepeq;      // separated by '='
+    b32  hasexp;     // an explicit argument is attached
+    Str  exp;
+} OTuple;
+
+typedef struct {
+    Str  s;
+    Arg *arg;
+} OStr;
+
+static b32 looks_negative(Str s)   // '^-\d+$|^-\d*\.\d+$' (a final \n is ok)
+{
+    if (s.len && s.data[s.len-1] == '\n') {
+        s = cuttail(s, 1);
+    }
+    if (s.len < 2 || s.data[0] != '-') {
+        return 0;
+    }
+    iz i = 1, nd = 0;
+    iz before = 0;
+    for (; i < s.len;) {
+        iz k = utf8_seq(s, i);
+        if (!k || decimaldigit(utf8_cp(s, i, k)) < 0) {
+            break;
+        }
+        i += k;
+        before++;
+    }
+    if (i == s.len) {
+        return before > 0;
+    }
+    if (s.data[i] != '.') {
+        return 0;
+    }
+    i++;
+    for (; i < s.len;) {
+        iz k = utf8_seq(s, i);
+        if (!k || decimaldigit(utf8_cp(s, i, k)) < 0) {
+            return 0;
+        }
+        i += k;
+        nd++;
+    }
+    return nd > 0;
+}
+
+// _get_option_tuples
+static iz ap_tuples(AP *ap, OStr *tab, iz ntab, Str arg, OTuple *out)
+{
+    iz n = 0;
+    Cut eq = cut(arg, '=');
+    if (arg.len > 1 && arg.data[1] == '-') {
+        for (iz k = 0; k < ntab; k++) {
+            if (startswith(tab[k].s, eq.head)) {
+                out[n++] = (OTuple){tab[k].arg, tab[k].s, eq.ok, eq.ok, eq.tail};
+            }
+        }
+    } else {
+        Str shortp = takehead(arg, 2);
+        for (iz k = 0; k < ntab; k++) {
+            if (equals(tab[k].s, shortp)) {
+                out[n++] = (OTuple){tab[k].arg, tab[k].s, 0, 1, cuthead(arg, 2)};
+            } else if (startswith(tab[k].s, eq.head)) {
+                out[n++] = (OTuple){tab[k].arg, tab[k].s, eq.ok, eq.ok, eq.tail};
+            }
+        }
+    }
+    (void)ap;
+    return n;
+}
+
+// _parse_optional: how many tuples (0: a positional, -1: none matched
+// but it is an optional all the same), filling out.
+static iz ap_optional(AP *ap, OStr *tab, iz ntab, Str arg, OTuple *out)
+{
+    if (!arg.len || arg.data[0] != '-') {
+        return 0;
+    }
+    for (iz k = 0; k < ntab; k++) {
+        if (equals(tab[k].s, arg)) {
+            out[0] = (OTuple){tab[k].arg, arg, 0, 0, {}};
+            return 1;
+        }
+    }
+    if (arg.len == 1) {
+        return 0;
+    }
+    Cut eq = cut(arg, '=');
+    if (eq.ok) {
+        for (iz k = 0; k < ntab; k++) {
+            if (equals(tab[k].s, eq.head)) {
+                out[0] = (OTuple){tab[k].arg, eq.head, 1, 1, eq.tail};
+                return 1;
+            }
+        }
+    }
+    iz n = ap_tuples(ap, tab, ntab, arg, out);
+    if (n) {
+        return n;
+    }
+    if (looks_negative(arg)) {
+        return 0;
+    }
+    for (iz i = 0; i < arg.len; i++) {
+        if (arg.data[i] == ' ') {
+            return 0;
+        }
+    }
+    out[0] = (OTuple){0, arg, 0, 0, {}};
+    return 1;
+}
+
+typedef struct {
+    Arg *x;
+    Str *args;
+    iz   n;
+} ActT;
+
+typedef struct {
+    OptVal  *vals;
+    OptVal **tail;
+    Str     *pos;
+    iz       npos;
+} APState;
+
+static void ap_record(AP *ap, APState *st, Arg *x, Str val)
+{
+    OptVal *v = new(ap->a, 1, OptVal);
+    v->id  = (i32)(x - ap->p->args);
+    v->val = val;
+    *st->tail = v;
+    st->tail  = &v->next;
+}
+
+// take_action: convert and check the values, then perform.
+static void ap_take(AP *ap, APState *st, Arg *x, Str *args, iz nargs)
+{
+    Ctx *c = ap->c;
+    Str  val = {};
+    if (nargs == 1 && (x->nargs == NA_ONE || x->nargs == NA_OPT)) {
+        val = args[0];
+        if (x->isint && !parseint(ap->a, val).ok) {
+            Str m = concat(ap->a, S("invalid int value: "), pyrepr(ap->a, val));
+            ap_argerror(ap, x, m);
+        }
+        if (x->nchoices) {
+            b32 ok = 0;
+            for (iz k = 0; k < x->nchoices; k++) {
+                ok |= equals(x->choices[k], val);
+            }
+            if (!ok) {
+                Str m = concat(ap->a, S("invalid choice: "),
+                               pyrepr(ap->a, val));
+                m = concat(ap->a, m, S(" (choose from "));
+                for (iz k = 0; k < x->nchoices; k++) {
+                    m = concat(ap->a, concat(ap->a, m, k ? S(", ") : S("")),
+                               x->choices[k]);
+                }
+                ap_argerror(ap, x, concat(ap->a, m, S(")")));
+            }
+        }
+    }
+    switch (x->kind) {
+    case AK_HELP:
+        print(c->out, ap_help(ap->a, ap->p, ap->prog, ap_width(c)));
+        finish(c, 0);
+    case AK_VERSION:
+        print(c->out, S("0.26.9.29\n"));
+        finish(c, 0);
+    case AK_COMPLETION:
+        print(c->out, S("Please install shtab firstly!\n"));
+        finish(c, 0);
+    default:
+        break;
+    }
+    if (!x->nopts) {   // a positional: its values
+        for (iz k = 0; k < nargs; k++) {
+            st->pos[st->npos++] = args[k];
+        }
+        return;
+    }
+    ap_record(ap, st, x, val);
+}
+
+static ParsedOpts ap_parse(Ctx *c, Parser *p, iz argc, Str *args)
+{
+    Arena *a = c->perm;
+    AP     ap = {c, p, c->prog, a};
+    APState st = {};
+    st.tail = &st.vals;
+    st.pos  = new(a, argc + 1, Str);
+
+    iz    ntab = 0;
+    OStr *tab  = new(a, p->nargs*4 + 1, OStr);
+    Arg  *posarg = 0;
+    for (iz k = 0; k < p->nargs; k++) {
+        Arg *x = &p->args[k];
+        for (iz q = 0; q < x->nopts; q++) {
+            tab[ntab++] = (OStr){x->opts[q], x};
+        }
+        if (!x->nopts) {
+            posarg = x;
+        }
+    }
+
+    // the O/A/- pattern, and the tuples of every option-like argument
+    u8      *pat    = new(a, argc + 1, u8);
+    OTuple **tuples = new(a, argc + 1, OTuple *);
+    iz      *ntup   = new(a, argc + 1, iz);
+    iz       maxopt = -1;
     for (iz i = 0; i < argc; i++) {
-        Str t = argv[i];
-        if (noparse) {
-            if (closed) {
-                r.extras[r.nextras++] = t;
-            } else {
-                r.pos[r.npos++] = t;
+        if (equals(args[i], S("--"))) {
+            pat[i] = '-';
+            for (i++; i < argc; i++) {
+                pat[i] = 'A';
             }
-            continue;
+            break;
         }
-        if (equals(t, S("--"))) {
-            noparse = 1;
-            if (r.npos) {
-                closed = 1;
-            }
-            continue;
+        OTuple *t = new(a, ntab + 2, OTuple);
+        iz      n = ap_optional(&ap, tab, ntab, args[i], t);
+        pat[i] = n ? 'O' : 'A';
+        if (n) {
+            tuples[i] = t;
+            ntup[i]   = n;
+            maxopt    = i;
         }
-        if (t.len >= 2 && t.data[0] == '-' && t.data[1] == '-') {
-            if (r.npos) {
-                closed = 1;
-            }
-            Str body = cuthead(t, 2);
-            Cut eq   = cut(body, '=');
-            Str name = eq.head;
-            Str val  = eq.tail;
-            iz  match = -1;
-            b32 exact = 0;
-            for (iz k = 0; k < nspecs; k++) {
-                if (equals(specs[k].name, name)) {
-                    match = k;
-                    exact = 1;
-                    break;
-                }
-            }
-            if (!exact) {
-                iz hits = 0;
-                for (iz k = 0; k < nspecs; k++) {
-                    if (startswith(specs[k].name, name)) {
-                        if (match < 0) {
-                            match = k;
-                        }
-                        hits++;
+    }
+
+    Str *extras  = new(a, argc + 1, Str);
+    iz   nextras = 0;
+    b32  posdone = 0;
+
+    // consume_positionals (one positional at most per parser)
+    #define PATAT(i) ((i) < argc ? pat[i] : 0)
+    iz start = 0;
+    for (;;) {
+        // the next option index, or the loop ends
+        if (start > maxopt) {
+            break;
+        }
+        iz next = start;
+        while (next < argc && !tuples[next]) {
+            next++;
+        }
+        if (start != next) {
+            // consume any positionals preceding the next option
+            iz stop = start;
+            if (posarg && !posdone) {
+                iz n = 0;
+                if (posarg->nargs == NA_OPT) {
+                    while (PATAT(start + n) == '-') n++;
+                    if (PATAT(start + n) == 'A') n++;
+                    while (PATAT(start + n) == '-') n++;
+                } else if (posarg->nargs == NA_STAR) {
+                    while (PATAT(start + n) == '-' || PATAT(start + n) == 'A') {
+                        n++;
+                    }
+                } else {   // exactly one: -*A-*
+                    iz m = 0;
+                    while (PATAT(start + m) == '-') m++;
+                    if (PATAT(start + m) == 'A') {
+                        n = m + 1;
+                        while (PATAT(start + n) == '-') n++;
                     }
                 }
-                if (hits > 1) {
-                    Str msg = concat(a, S("ambiguous option: --"), name);
-                    msg = concat(a, msg, S(" could match"));
-                    for (iz k = 0; k < nspecs; k++) {
-                        if (startswith(specs[k].name, name)) {
-                            msg = concat(a, msg, S(" --"));
-                            msg = concat(a, msg, specs[k].name);
+                b32 consumed = !(n == 0 && PATAT(start + n) == 'O');
+                if (posarg->nargs == NA_ONE && n == 0) {
+                    consumed = 0;
+                }
+                if (consumed) {
+                    Str *vals = new(a, n + 1, Str);
+                    iz   nv = 0;
+                    b32  skipped = 0;
+                    for (iz i = start; i < start + n; i++) {
+                        if (pat[i] == '-' && !skipped) {
+                            skipped = 1;   // the first -- is dropped
+                            continue;
                         }
+                        vals[nv++] = args[i];
                     }
-                    die_usage(e, msg);
+                    ap_take(&ap, &st, posarg, vals, nv);
+                    posdone = 1;
+                    stop = start + n;
                 }
             }
-            if (match < 0) {
-                r.extras[r.nextras++] = t;
+            if (stop > start) {
+                start = stop;
                 continue;
             }
-            OptSpec *sp = &specs[match];
-            if (sp->value) {
-                if (!eq.ok) {
-                    if (i + 1 >= argc) {
-                        Str msg = concat(a, S("argument --"), sp->name);
-                        msg = concat(a, msg, S(": expected one argument"));
-                        die_usage(e, msg);
-                    }
-                    val = argv[++i];
-                }
-                if (sp->nchoices) {
-                    b32 ok = 0;
-                    for (iz k = 0; k < sp->nchoices; k++) {
-                        ok |= equals(sp->choices[k], val);
-                    }
-                    if (!ok) {
-                        printchoices(e, sp, val);
-                    }
-                }
-            } else if (eq.ok) {
-                Str msg = concat(a, S("argument --"), sp->name);
-                msg = concat(a, msg, S(": ignored explicit argument '"));
-                msg = concat(a, msg, val);
-                msg = concat(a, msg, S("'"));
-                die_usage(e, msg);
+            // not at an option: the arguments up to it are extra
+            for (iz i = start; i < next; i++) {
+                extras[nextras++] = args[i];
             }
-            OptVal *v = new(a, 1, OptVal);
-            v->id  = (i32)match;
-            v->val = val;
-            *tail  = v;
-            tail   = &v->next;
-            if (sp->action) {
-                perform_action(e, sp, val);
-            }
-            continue;
+            start = next;
         }
-        if (t.len >= 2 && t.data[0] == '-' && t.data[1] != '-') {
-            if (digit(t.data[1])) {   // a negative number is a positional
-                if (closed) {
-                    r.extras[r.nextras++] = t;
-                } else {
-                    r.pos[r.npos++] = t;
-                }
-                continue;
+
+        // consume_optional
+        OTuple *t = tuples[start];
+        iz      nt = ntup[start];
+        if (nt > 1) {
+            Str m = concat(a, S("ambiguous option: "), args[start]);
+            m = concat(a, m, S(" could match "));
+            for (iz k = 0; k < nt; k++) {
+                m = concat(a, concat(a, m, k ? S(", ") : S("")), t[k].ostr);
             }
-            if (r.npos) {
-                closed = 1;
+            ap_error(&ap, m);
+        }
+        Arg *x = t[0].arg;
+        Str  ostr = t[0].ostr;
+        b32  sepeq = t[0].sepeq, hasexp = t[0].hasexp;
+        Str  exp = t[0].exp;
+        ActT *acts = new(a, args[start].len + 2, ActT);
+        iz   nacts = 0;
+        iz   stop = start + 1;
+        for (;;) {
+            if (!x) {
+                extras[nextras++] = args[start];
+                stop = start + 1;
+                nacts = -1;
+                break;
             }
-            b32 claimed = 0;
-            for (iz k = 1; k < t.len; k++) {
-                u8 ch = t.data[k];
-                iz  m = -1;
-                for (iz j = 0; j < nspecs && m < 0; j++) {
-                    for (iz q = 0; q < specs[j].shorts.len; q++) {
-                        if (specs[j].shorts.data[q] == ch) {
-                            m = j;
+            if (hasexp) {
+                iz count = x->nargs == NA_ZERO ? 0 : 1;   // match_argument(.., 'A')
+                if (count == 0 && ostr.data[1] != '-' && exp.len) {
+                    if (sepeq || exp.data[0] == '-') {
+                        Str m = concat(a, S("ignored explicit argument "),
+                                       pyrepr(a, exp));
+                        ap_argerror(&ap, x, m);
+                    }
+                    acts[nacts].x = x;
+                    acts[nacts].args = 0;
+                    acts[nacts++].n = 0;
+                    Str o2 = concat(a, clone(a, takehead(ostr, 1)),
+                                    takehead(exp, 1));
+                    Arg *x2 = 0;
+                    for (iz k = 0; k < ntab; k++) {
+                        if (equals(tab[k].s, o2)) {
+                            x2 = tab[k].arg;
                             break;
                         }
                     }
-                }
-                if (m < 0) {
-                    if (!claimed) {
-                        r.extras[r.nextras++] = t;   // whole token unrecognized
-                        claimed = 1;
+                    if (x2) {
+                        x = x2;
+                        ostr = o2;
+                        exp = cuthead(exp, 1);
+                        if (!exp.len) {
+                            hasexp = 0;
+                            sepeq = 0;
+                        } else if (exp.data[0] == '=') {
+                            sepeq = 1;
+                            exp = cuthead(exp, 1);
+                        } else {
+                            sepeq = 0;
+                        }
+                        continue;
                     }
+                    extras[nextras++] = concat(a, clone(a, takehead(ostr, 1)),
+                                               exp);
+                    stop = start + 1;
                     break;
+                } else if (count == 1) {
+                    Str *v = new(a, 1, Str);
+                    v[0] = exp;
+                    acts[nacts].x = x;
+                    acts[nacts].args = v;
+                    acts[nacts++].n = 1;
+                    stop = start + 1;
+                    break;
+                } else {
+                    Str m = concat(a, S("ignored explicit argument "),
+                                   pyrepr(a, exp));
+                    ap_argerror(&ap, x, m);
                 }
-                affirm(!specs[m].value);
-                OptVal *v = new(a, 1, OptVal);
-                v->id = (i32)m;
-                *tail = v;
-                tail  = &v->next;
-                if (specs[m].action) {
-                    perform_action(e, &specs[m], (Str){});
+            } else {
+                iz first = start + 1;
+                iz count = 0;
+                if (x->nargs == NA_ONE) {
+                    if (PATAT(first) != 'A') {
+                        ap_argerror(&ap, x, S("expected one argument"));
+                    }
+                    count = 1;
+                }
+                acts[nacts].x = x;
+                acts[nacts].args = args + first;
+                acts[nacts++].n = count;
+                stop = first + count;
+                break;
+            }
+        }
+        if (nacts > 0) {
+            for (iz k = 0; k < nacts; k++) {
+                ap_take(&ap, &st, acts[k].x, acts[k].args, acts[k].n);
+            }
+        }
+        start = stop;
+    }
+
+    // consume any positionals following the last optional
+    {
+        iz stop = start;
+        if (posarg && !posdone) {
+            iz n = 0;
+            if (posarg->nargs == NA_OPT) {
+                while (PATAT(start + n) == '-') n++;
+                if (PATAT(start + n) == 'A') n++;
+                while (PATAT(start + n) == '-') n++;
+            } else if (posarg->nargs == NA_STAR) {
+                while (PATAT(start + n) == '-' || PATAT(start + n) == 'A') {
+                    n++;
+                }
+            } else {
+                iz m = 0;
+                while (PATAT(start + m) == '-') m++;
+                if (PATAT(start + m) == 'A') {
+                    n = m + 1;
+                    while (PATAT(start + n) == '-') n++;
                 }
             }
-            continue;
+            b32 consumed = !(n == 0 && PATAT(start + n) == 'O');
+            if (posarg->nargs == NA_ONE && n == 0) {
+                consumed = 0;
+            }
+            if (consumed) {
+                Str *vals = new(a, n + 1, Str);
+                iz   nv = 0;
+                b32  skipped = 0;
+                for (iz i = start; i < start + n; i++) {
+                    if (pat[i] == '-' && !skipped) {
+                        skipped = 1;
+                        continue;
+                    }
+                    vals[nv++] = args[i];
+                }
+                ap_take(&ap, &st, posarg, vals, nv);
+                stop = start + n;
+            }
         }
-        // positional
-        if (closed) {
-            r.extras[r.nextras++] = t;
-        } else {
-            r.pos[r.npos++] = t;
+        for (iz i = stop; i < argc; i++) {
+            extras[nextras++] = args[i];
         }
     }
+    #undef PATAT
 
-    // argparse can split one optional positional off a run but no more.
-    if (nargs == 0) {
-        for (iz k = 0; k < r.npos; k++) {
-            r.extras[r.nextras++] = r.pos[k];
+    if (nextras) {
+        Str m = S("unrecognized arguments:");
+        for (iz k = 0; k < nextras; k++) {
+            m = concat(a, concat(a, m, S(" ")), extras[k]);
         }
-        r.npos = 0;
-    } else if (nargs == 1 && r.npos > 1) {
-        for (iz k = 1; k < r.npos; k++) {
-            r.extras[r.nextras++] = r.pos[k];
-        }
-        r.npos = 1;
+        ap_error(&ap, m);
     }
-
-    if (r.nextras) {
-        Str msg = S("unrecognized arguments:");
-        for (iz k = 0; k < r.nextras; k++) {
-            msg = concat(a, msg, S(" "));
-            msg = concat(a, msg, r.extras[k]);
-        }
-        die_usage(e, msg);
-    }
+    ParsedOpts r = {};
+    r.vals = st.vals;
+    r.pos  = st.pos;
+    r.npos = st.npos;
     return r;
 }
 
@@ -1763,8 +2989,21 @@ static Strs volumes_list(Ctx *c, Arena *a, Arena)
     if (!readall(c->os, a, S("/proc/self/mounts"), &content)) {
         return (Strs){};
     }
-    Str *v = new(a, 64, Str);
+    iz  nlines = 1;
+    for (iz i = 0; i < content.len; i++) {
+        nlines += content.data[i] == '\n';
+    }
+    Str *v = new(a, nlines, Str);
     iz  n  = 0;
+
+    // Mount points seen so far: an open-addressed table of indexes into v,
+    // one more than the index so that zero means an empty slot.
+    iz  tcap = 2;
+    while (tcap < nlines*2) {
+        tcap *= 2;
+    }
+    iz *seen = new(a, tcap, iz);
+
     for (Cut lc = {.tail=content, .ok=1}; lc.ok;) {
         lc       = cut(lc.tail, '\n');
         Str line = lc.head;
@@ -1786,12 +3025,24 @@ static Strs volumes_list(Ctx *c, Arena *a, Arena)
         b32 keep = mountfstype_ok(fs)
                 || startswith(dev, S("/dev/"))
                 || (equals(fs, S("tmpfs")) && equals(mnt, S("/tmp")));
-        b32 dup  = 0;
-        for (iz k = 0; k < n; k++) {
-            dup |= equals(v[k], mnt);
+        if (!keep) {
+            continue;
         }
-        if (keep && !dup && n < 64) {
-            v[n++] = mnt;
+        u64 h = 0xcbf29ce484222325u;   // FNV-1a
+        for (iz k = 0; k < mnt.len; k++) {
+            h = (h ^ mnt.data[k]) * 0x100000001b3u;
+        }
+        b32 dup = 0;
+        iz  i   = (iz)(h & (u64)(tcap - 1));
+        for (; seen[i]; i = (i + 1) & (tcap - 1)) {
+            if (equals(v[seen[i] - 1], mnt)) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            seen[i] = n + 1;
+            v[n++]  = mnt;
         }
     }
     return (Strs){v, n};
@@ -1805,7 +3056,7 @@ static void scan_volume_dirs(Ctx *c, Arena *a, Arena scratch, Strs volumes,
 {
     for (iz k = 0; k < volumes.len; k++) {
         Str vol    = volumes.data[k];
-        Str parent = concat(a, vol, S("/.Trash"));
+        Str parent = join(a, vol, S(".Trash"));
         Str td1    = join(a, parent, istr(a, uid));
         Stat st1   = {};
         if (os_stat(c->os, scratch, td1, 1, &st1)) {
@@ -1820,7 +3071,7 @@ static void scan_volume_dirs(Ctx *c, Arena *a, Arena scratch, Strs volumes,
                 evpush(a, ev, EV_FOUND, td1, vol);
             }
         }
-        Str td2  = concat(a, concat(a, vol, S("/.Trash-")), istr(a, uid));
+        Str td2  = join(a, vol, concat(a, S(".Trash-"), istr(a, uid)));
         Stat st2 = {};
         if (os_stat(c->os, scratch, td2, 1, &st2) && st2.kind == KIND_DIR) {
             evpush(a, ev, EV_FOUND, td2, vol);
@@ -1831,6 +3082,7 @@ static void scan_volume_dirs(Ctx *c, Arena *a, Arena scratch, Strs volumes,
 typedef struct {
     b32 all_users;
     i32 uid;
+    b32 homevol;   // the home trash's volume is its mount point, not "/"
 } ScanOpts;
 
 typedef struct {
@@ -1856,7 +3108,10 @@ static Scan scan_trash_dirs(Ctx *c, Arena *a, Arena scratch, ScanOpts o)
     } else {
         Str ht;
         if (home_trash(c, a, &ht)) {
-            evpush(a, &ev, EV_FOUND, ht, S("/"));
+            Str hv = o.homevol
+                   ? volume_of(c->os, a, scratch, abspath_(c, a, ht))
+                   : S("/");
+            evpush(a, &ev, EV_FOUND, ht, hv);
         }
         scan_volume_dirs(c, a, scratch, volumes_list(c, a, scratch),
                          o.uid, &ev);
@@ -1867,12 +3122,14 @@ static Scan scan_trash_dirs(Ctx *c, Arena *a, Arena scratch, ScanOpts o)
 
 // Putting files in the trash (trash-put, trash)
 
+// Python's path.rstrip('/') or path: a path of only slashes stays as given.
 static Str stripslashes(Str s)
 {
-    while (s.len > 1 && s.data[s.len-1] == '/') {
-        s = cuttail(s, 1);
+    Str t = s;
+    while (t.len && t.data[t.len-1] == '/') {
+        t = cuttail(t, 1);
     }
-    return s;
+    return t.len ? t : s;
 }
 
 // The description vocabulary of trash-put's messages (spec 5.4).
@@ -1914,18 +3171,186 @@ static Str errtext(Arena *a, Os *os, i32 err, Str path)
     return s;
 }
 
-// ... and for two paths, as rename errors print.
-static Str errtext2(Arena *a, Os *os, i32 err, Str from, Str to)
+// rm -r without following symlinks.  1 when the path is gone.
+static b32 rmtree(Ctx *c, Arena scratch, Str path)
 {
-    Str s = concat(a, S("[Errno "), istr(a, err));
-    s = concat(a, s, S("] "));
-    s = concat(a, s, os_strerror(os, err));
-    s = concat(a, s, S(": '"));
-    s = concat(a, s, from);
-    s = concat(a, s, S("' -> '"));
-    s = concat(a, s, to);
-    s = concat(a, s, S("'"));
-    return s;
+    Os *os = c->os;
+    Stat st = {};
+    if (!os_stat(os, scratch, path, 0, &st)) {
+        return os_errno(os) == ENOENT;   // gone is gone
+    }
+    if (st.kind == KIND_DIR) {
+        Arena t       = scratch;
+        b32 ok;
+        DirEnt *ents  = os_listdir(os, &t, path, &ok);
+        if (ok && ents) {
+            for (DirEnt *e = ents; e; e = e->next) {
+                Arena tc = t;   // fresh: past ents, so children cannot
+                if (!rmtree(c, tc, join(&tc, path, e->name))) {   // clobber
+                    return 0;
+                }
+            }
+        }
+        return os_rmdir(os, scratch, path);
+    }
+    return os_unlink(os, scratch, path);
+}
+
+// unlink(2) with a recursive fallback, like os.remove falling back to
+// shutil.rmtree.  1 when the path is gone.
+static b32 remove_path(Ctx *c, Arena scratch, Str path)
+{
+    if (os_unlink(c->os, scratch, path)) {
+        return 1;
+    }
+    i32 err = os_errno(c->os);
+    if (err == ENOENT) {
+        return 1;
+    }
+    return rmtree(c, scratch, path);
+}
+
+// Copies one file's bytes and mode.  False, with *preason, on failure.
+static b32 copy_file(Ctx *c, Arena *a, Arena scratch, Str src, Str dst,
+                     u32 mode, Str *preason)
+{
+    Os *os = c->os;
+    i32 in = os_open(os, scratch, src, 0, 0);
+    if (in < 0) {
+        *preason = errtext(a, os, os_errno(os), src);
+        return 0;
+    }
+    i32 out = os_open(os, scratch, dst, 1, mode & 0777u);
+    if (out < 0) {
+        os_close(os, in);
+        *preason = errtext(a, os, os_errno(os), dst);
+        return 0;
+    }
+    u8 *buf = new(&scratch, 1 << 12, u8);
+    for (;;) {
+        iz r = os_read(os, in, buf, 1 << 12);
+        if (r < 0) {
+            os_close(os, in);
+            os_close(os, out);
+            *preason = errtext(a, os, os_errno(os), src);
+            return 0;
+        }
+        if (!r) {
+            break;
+        }
+        if (!os_write(os, out, buf, r)) {
+            os_close(os, in);
+            os_close(os, out);
+            *preason = errtext(a, os, os_errno(os), dst);
+            return 0;
+        }
+    }
+    os_close(os, in);
+    os_close(os, out);
+    return 1;
+}
+
+// Copies a file, symlink or directory tree, leaving the source alone
+// (copytree with symlinks=True).  A directory is created writable and given
+// the source's mode once it is filled, so a read-only one can be copied.
+static b32 copy_path(Ctx *c, Arena *a, Arena scratch, Str src, Str dst,
+                     Str *preason)
+{
+    Os *os = c->os;
+    Stat ss = {};
+    if (!os_stat(os, scratch, src, 0, &ss)) {
+        *preason = errtext(a, os, os_errno(os), src);
+        return 0;
+    }
+    switch (ss.kind) {
+    case KIND_LINK: {
+        Str target;
+        if (!os_readlink(os, a, src, &target)) {
+            *preason = errtext(a, os, os_errno(os), src);
+            return 0;
+        }
+        if (!os_symlink(os, scratch, target, dst)) {
+            *preason = errtext(a, os, os_errno(os), dst);
+            return 0;
+        }
+        return 1;
+    }
+    case KIND_DIR: {
+        if (!os_mkdir(os, scratch, dst, 0777)) {
+            *preason = errtext(a, os, os_errno(os), dst);
+            return 0;
+        }
+        Arena t = scratch;
+        b32 ok;
+        DirEnt *ents = os_listdir(os, &t, src, &ok);
+        if (!ok) {
+            *preason = errtext(a, os, os_errno(os), src);
+            return 0;
+        }
+        for (DirEnt *e = ents; e; e = e->next) {
+            Arena tc = t;
+            Str s2 = join(&tc, src, e->name);
+            Str d2 = join(&tc, dst, e->name);
+            if (!copy_path(c, a, tc, s2, d2, preason)) {
+                return 0;
+            }
+        }
+        os_chmod(os, scratch, dst, ss.mode);
+        return 1;
+    }
+    case KIND_FILE: {
+        Stat ds = {};   // copy2 overwrites a file in place
+        if (os_stat(os, scratch, dst, 0, &ds) && ds.kind != KIND_DIR) {
+            os_unlink(os, scratch, dst);
+        }
+        return copy_file(c, a, scratch, src, dst, ss.mode, preason);
+    }
+    case KIND_FIFO:
+        *preason = concat(a, concat(a, S("`"), src), S("` is a named pipe"));
+        return 0;
+    default:
+        *preason = errtext(a, os, EINVAL, src);
+        return 0;
+    }
+}
+
+// rename(2) when possible; when it fails for any reason, copy then remove
+// the source, like shutil.move.  The error reported is that of the fallback,
+// as there.  A failed copy leaves the source whole.
+static b32 move_path(Ctx *c, Arena *a, Arena scratch, Str src, Str dst,
+                     Str *preason)
+{
+    if (os_rename(c->os, scratch, src, dst)) {
+        return 1;
+    }
+    if (!copy_path(c, a, scratch, src, dst, preason)) {
+        return 0;
+    }
+    if (!remove_path(c, scratch, src)) {
+        *preason = errtext(a, c->os, os_errno(c->os), src);
+        return 0;
+    }
+    return 1;
+}
+
+// entries_if_dir_exists: a directory that cannot even be stat'ed (missing,
+// or hidden behind an unreadable parent) counts as missing and *state is 1;
+// one that exists but cannot be listed leaves its errno in *state as a
+// negative number (upstream dies on it); otherwise *state is 0.
+static DirEnt *listexisting(Ctx *c, Arena *a, Str path, i32 *state)
+{
+    *state = 0;
+    Stat st = {};
+    if (!os_stat(c->os, *a, path, 1, &st)) {
+        *state = 1;
+        return 0;
+    }
+    b32 ok;
+    DirEnt *ents = os_listdir(c->os, a, path, &ok);
+    if (!ok) {
+        *state = -os_errno(c->os);
+    }
+    return ents;
 }
 
 // Trash dirs under HOME show as ~/... in -v messages (spec 5.8).
@@ -1945,7 +3370,8 @@ static Str shrink(Os *os, Arena *a, Str path, b32 disabled)
 }
 
 // mkdir -p with Python's error semantics: an existing directory is fine, an
-// existing file is FileExistsError; parents are created with the same mode.
+// existing file is FileExistsError; only the leaf gets mode, parents are
+// created 0777 (umask applies), as os.makedirs does.
 static i32 makedirs(Ctx *c, Arena scratch, Str path, u32 mode, i32 *perr,
                     Str *epath)
 {
@@ -1965,7 +3391,7 @@ static i32 makedirs(Ctx *c, Arena scratch, Str path, u32 mode, i32 *perr,
     if (err == ENOENT) {
         Str d = dirname(path);
         if (!equals(d, path) && !equals(d, S("."))) {
-            if (makedirs(c, scratch, d, mode, perr, epath)) {
+            if (makedirs(c, scratch, d, 0777, perr, epath)) {
                 return -1;
             }
             if (os_mkdir(c->os, scratch, path, mode)) {
@@ -1986,28 +3412,79 @@ static i32 makedirs(Ctx *c, Arena scratch, Str path, u32 mode, i32 *perr,
     return -1;
 }
 
+// Invalid UTF-8 bytes the way Python's stderr shows file names (surrogate
+// escapes with backslashreplace): byte 0xff is \udcff.
+static Str pyesc(Arena *a, Str s)
+{
+    b32 bad = 0;
+    for (iz i = 0; i < s.len && !bad;) {
+        iz k = utf8_seq(s, i);
+        bad = !k;
+        i += k ? k : 1;
+    }
+    if (!bad) {
+        return s;
+    }
+    Str r = {.data = new(a, 0, u8)};
+    for (iz i = 0; i < s.len;) {
+        iz k = utf8_seq(s, i);
+        if (k) {
+            r = concat(a, r, span(s.data + i, s.data + i + k));
+            i += k;
+        } else {
+            u8 esc[6] = {'\\', 'u', 'd', 'c',
+                         (u8)"0123456789abcdef"[s.data[i]>>4],
+                         (u8)"0123456789abcdef"[s.data[i]&15]};
+            r = concat(a, r, (Str){esc, 6});
+            i++;
+        }
+    }
+    return r;
+}
+
+// A line of trash-put's log on stderr: "<prog>: <msg>".
+static void putlog(Ctx *c, Arena *a, Str msg)
+{
+    prefixes(c, c->err, pyesc(a, msg));
+}
+
 // Writes the .trashinfo for one candidate, picking a collision suffix
 // (spec 3.2).  Returns 0 and sets *outinfo/*outfiles, or -1 with *preason.
+// Like upstream, only errors that no other name could fix (permissions, a
+// full or read-only disk) end the search; a name that is too long shrinks
+// the stem from then on, and the others just try the next suffix.  Failed
+// attempts are logged under -vv.
 static i32 write_trashinfo(Ctx *c, Arena *a, Arena scratch, Str trashdir,
-                           Str stem, Str origloc, DateTime now, Str *outinfo,
-                           Str *outfiles, Str *preason)
+                           Str stem, Str origloc, DateTime now, b32 debug,
+                           Str *outinfo, Str *outfiles, Str *preason)
 {
-    enum { MAXATTEMPTS = 10000 };
+    enum { MAXATTEMPTS = 1 << 17 };   // upstream retries without end
 
+    b32 toolong = 0;
     for (i64 k = 0; k < MAXATTEMPTS; k++) {
         Str suffix = k == 0
                    ? S("")
                    : k <= 99
                    ? concat(a, S("_"), istr(a, k))
                    : concat(a, S("_"), istr(a, (i64)(os_rand(c->os) & 65535)));
-        Str name   = concat(a, stem, suffix);
-        Str files  = join(a, join(a, trashdir, S("files")), name);
+        Str after  = concat(a, suffix, S(".trashinfo"));
+        Str base   = stem;
+        if (toolong) {   // basename[0:len(basename) - len(after)], in chars
+            iz n = countchars(stem) - countchars(after);
+            if (n < 0) {
+                n += countchars(stem);
+            }
+            base = takechars(stem, n < 0 ? 0 : n);
+        }
+        Str name     = concat(a, base, suffix);
+        Str files    = join(a, join(a, trashdir, S("files")), name);
         if (lexists(c->os, scratch, files)) {
             continue;
         }
-        Str info     = concat(a, name, S(".trashinfo"));
-        Str infopath = join(a, join(a, trashdir, S("info")), info);
+        Str infopath = join(a, join(a, trashdir, S("info")),
+                            concat(a, base, after));
         i32 fd = os_open(c->os, scratch, infopath, 1, 0600);
+        i32 err = 0;
         if (fd >= 0) {
             Output *b = newoutput(a, c->os, fd);
             print(b, S("[Trash Info]\nPath="));
@@ -2016,30 +3493,30 @@ static i32 write_trashinfo(Ctx *c, Arena *a, Arena scratch, Str trashdir,
             print(b, format_datetime(a, now, '-', 'T'));
             print(b, S("\n"));
             flush(b);
-            os_close(c->os, fd);
             if (b->err) {
-                os_unlink(c->os, scratch, infopath);
-                *preason = S("error writing the trashinfo file");
-                return -1;
+                err = os_errno(c->os);
             }
-            *outinfo  = infopath;
-            *outfiles = files;
-            return 0;
-        }
-        i32 err = os_errno(c->os);
-        if (err == ENAMETOOLONG) {
-            // Shrink the stem so <stem><suffix>.trashinfo stays within
-            // NAME_MAX (255); this also bounds the retry loop, fixing the
-            // upstream pathology that only ever trimmed the suffix length.
-            iz maxstem = 255 - 10 - suffix.len;
-            if (maxstem >= 0 && stem.len > maxstem) {
-                stem = takehead(stem, maxstem);
+            os_close(c->os, fd);
+            if (!b->err) {
+                *outinfo  = infopath;
+                *outfiles = files;
+                return 0;
             }
-            continue;
+            os_unlink(c->os, scratch, infopath);
+        } else {
+            err = os_errno(c->os);
         }
-        *preason = concat(a, S("error during trashinfo creation: "),
-                          errtext(a, c->os, err, infopath));
-        return -1;
+        if (err == EACCES || err == EPERM || err == ENOSPC || err == EDQUOT
+            || err == EROFS) {
+            *preason = concat(a, S("failed to create trashinfo file: "),
+                              errtext(a, c->os, err, infopath));
+            return -1;
+        }
+        toolong |= err == ENAMETOOLONG;
+        if (debug) {
+            Str m = concat(a, S("attempt for creating "), infopath);
+            putlog(c, a, concat(a, m, S(" failed.")));
+        }
     }
     *preason = S("no available trash name");
     return -1;
@@ -2067,6 +3544,7 @@ enum : i32 { CHECK_NONE = 0, CHECK_TOPDIR };
 
 typedef struct {
     Str td;        // trash dir path
+    Str volume;    // the candidate's own volume, as -vv shows it
     Str topdir;    // volume prefix stripped from Path=, "/" for absolute
     i32 check;
     b32 relative;
@@ -2131,7 +3609,7 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
         m = concat(a, m, S(" '"));
         m = concat(a, m, raw);
         m = concat(a, m, S("'"));
-        prefixes(c, c->err, m);
+        putlog(c, a, m);
         *pfailed = 1;
         return;
     }
@@ -2141,28 +3619,15 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
         if (f.force) {
             return;
         }
-        prefixes(c, c->err, concat(a, concat(a,  S("cannot trash non existent '"),
-                                   raw),  S("'")));
+        putlog(c, a, concat(a, concat(a, S("cannot trash non existent '"),
+                                      raw), S("'")));
         *pfailed = 1;
         return;
     }
 
-    // Delete-permission pre-check on the realpath'd parent (step 4).
-    Str np     = normpath(a, raw);
-    Str parent = dirname(np);
-    Str rdir   = realpath_(os, a, scratch, parent);
-    if (!os_access(os, scratch, rdir, ACCESS_W | ACCESS_X)) {
-        Str m = concat(a, S("cannot trash "), desc);
-        m = concat(a, m, S(" '"));
-        m = concat(a, m, raw);
-        m = concat(a, m, S("' because deleting it is not allowed"));
-        prefixes(c, c->err, m);
-        *pfailed = 1;
-        return;
-    }
-
-    // Interactive prompt, only for accessible paths (step 5); dangling
-    // symlinks fail F_OK and are not asked about.
+    // Interactive prompt, only for accessible paths (step 4); dangling
+    // symlinks fail F_OK and are not asked about.  It comes before the
+    // delete-permission check, as upstream's order has it.
     if (f.interactive && os_access(os, scratch, raw, ACCESS_F)) {
         flush(c->out);
         print(c->out, c->prog);
@@ -2182,7 +3647,23 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
         }
     }
 
-    Str realvol = volume_of(os, a, scratch, rdir);
+    // Delete-permission pre-check on the realpath'd parent of the argument
+    // as given (step 5); the volume comes from the same parent.  The
+    // original location instead resolves the lexically normalized path.
+    Str np     = normpath(a, raw);
+    Str vdir   = realpath_(c, a, scratch, dirname(raw));
+    Str rdir   = realpath_(c, a, scratch, dirname(np));
+    if (!os_access(os, scratch, vdir, ACCESS_W | ACCESS_X)) {
+        Str m = concat(a, S("cannot trash "), desc);
+        m = concat(a, m, S(" '"));
+        m = concat(a, m, raw);
+        m = concat(a, m, S("' because deleting it is not allowed"));
+        putlog(c, a, m);
+        *pfailed = 1;
+        return;
+    }
+
+    Str realvol = volume_of(os, a, scratch, vdir);
     Str filevol = f.force_volume.data ? f.force_volume : realvol;
 
     // Candidates, in order (spec 5.5).  With --trash-dir there is exactly
@@ -2193,33 +3674,39 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
     if (pe->trash_dir.data) {
         Cand n       = {};
         n.td         = pe->trash_dir;
-        n.topdir     = volume_of(os, a, scratch,
-                                 realpath_(os, a, scratch, normpath(a, n.td)));
+        n.volume     = volume_of(os, a, scratch,
+                                 abspath_(c, a, n.td));
+        n.topdir     = n.volume;
         n.relative   = 1;
         cands[ncands++] = n;
     } else {
         if (pe->home.data) {
             Cand n    = {};
             n.td      = pe->home;
+            n.volume  = volume_of(os, a, scratch,
+                                  abspath_(c, a, n.td));
             n.topdir  = S("/");
             cands[ncands++] = n;
         }
         Cand m1        = {};
-        m1.td          = join(a, concat(a, filevol, S("/.Trash/")),
-                              istr(a, uid));
+        m1.td          = join(a, filevol,
+                              concat(a, S(".Trash/"), istr(a, uid)));
+        m1.volume      = filevol;
         m1.topdir      = filevol;
         m1.check       = CHECK_TOPDIR;
         m1.relative    = 1;
         cands[ncands++] = m1;
         Cand m2        = {};
-        m2.td          = concat(a, concat(a, filevol, S("/.Trash-")),
-                                istr(a, uid));
+        m2.td          = join(a, filevol,
+                              concat(a, S(".Trash-"), istr(a, uid)));
+        m2.volume      = filevol;
         m2.topdir      = filevol;
         m2.relative    = 1;
         cands[ncands++] = m2;
         if (pe->home_fallback && pe->home.data) {
             Cand n         = {};
             n.td           = pe->home;
+            n.volume       = cands[0].volume;
             n.topdir       = S("/");
             n.homefallback = 1;
             cands[ncands++] = n;
@@ -2233,10 +3720,10 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
         Cand *cd = &cands[k];
         if (f.verbose >= 2) {
             Str m =  S("trying trash dir: ");
-            m = concat(a, m, cd->td);
+            m = concat(a, m, normpath(a, cd->td));
             m = concat(a, m, S(" from volume: "));
-            m = concat(a, m, filevol);
-            prefixes(c, c->err, m);
+            m = concat(a, m, cd->volume);
+            putlog(c, a, m);
         }
 
         // Security checks (spec 4.2): info/files symlinks first for every
@@ -2285,7 +3772,7 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
                 reason = S("home fallback not enabled");
             } else if (!cd->homefallback) {
                 Str tv = volume_of(os, a, scratch,
-                                   realpath_(os, a, scratch,
+                                   realpath_(c, a, scratch,
                                              normpath(a, cd->td)));
                 if (!equals(tv, filevol)) {
                     Str m =  S("trash dir and file to be trashed "
@@ -2323,16 +3810,19 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
             os_now(os, &now);
             Str infopath, files;
             if (write_trashinfo(c, a, scratch, cd->td, stem, origloc, now,
-                                &infopath, &files, &reason)) {
+                                f.verbose >= 2, &infopath, &files,
+                                &reason)) {
                 // reason is set
             } else {
                 if (f.verbose >= 2) {
                     Str m =  S(".trashinfo created as ");
                     m = concat(a, m, infopath);
                     m = concat(a, m, S("."));
-                    prefixes(c, c->err, m);
+                    putlog(c, a, m);
                 }
-                if (trash_rename(c, scratch, np, files, &st)) {
+                Str why = {};
+                if (trash_rename(c, scratch, np, files, &st)
+                    || move_path(c, a, scratch, np, files, &why)) {
                     trashed = 1;
                     if (f.verbose >= 1) {
                         Str m =  S("'");
@@ -2340,20 +3830,20 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
                         m = concat(a, m, S("' trashed in "));
                         m = concat(a, m, shrink(os, a, normpath(a, cd->td),
                                                 pe->no_shrink));
-                        prefixes(c, c->err, m);
+                        putlog(c, a, m);
                     }
                 } else {
+                    // Drop a partial copy: no unremovable file may stay.
                     if (lexists(os, scratch, files)) {
-                        os_unlink(os, scratch, files);
+                        remove_path(c, scratch, files);
                     }
                     os_unlink(os, scratch, infopath);
-                    i32 err = os_errno(os);
                     Str m =  S("failed to move ");
-                    m = concat(a, m, np);
+                    m = concat(a, m, raw);
                     m = concat(a, m, S(" in "));
                     m = concat(a, m, join(a, cd->td, S("files")));
                     m = concat(a, m, S(": "));
-                    m = concat(a, m, errtext2(a, os, err, np, files));
+                    m = concat(a, m, why);
                     reason = m;
                 }
             }
@@ -2364,7 +3854,7 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
             m = concat(a, m, S(":  `- failed to trash "));
             m = concat(a, m, raw);
             m = concat(a, m, S(" in "));
-            m = concat(a, m, cd->td);
+            m = concat(a, m, normpath(a, cd->td));
             m = concat(a, m, S(", because "));
             m = concat(a, m, reason);
             m = concat(a, m, S("\n"));
@@ -2379,75 +3869,84 @@ static void put_one_file(Ctx *c, Arena *a, Arena scratch, Str arg, PutFlags f,
         m = concat(a, m, S("' (from volume '"));
         m = concat(a, m, filevol);
         m = concat(a, m, S("')"));
-        prefixes(c, c->err, m);
-        print(c->err, block);
+        putlog(c, a, m);
+        print(c->err, pyesc(a, block));
         *pfailed = 1;
     }
 }
 
-static const char put_help_body[] =
-    "\n"
-    "Put files in trash.\n"
-    "\n"
-    "options:\n"
-    "  -h, --help            show this help message and exit\n"
-    "  --print-completion {bash,zsh,tcsh}\n"
-    "                        print shell completion script\n"
-    "  -d, --directory       ignored (for compatibility with rm)\n"
-    "  -f, --force           silently ignore non existent files\n"
-    "  -i, --interactive     ask before trashing each files\n"
-    "  -r, -R, --recursive   ignored (for compatibility with rm)\n"
-    "  --trash-dir TRASHDIR  use TRASHDIR as trash folder\n"
-    "  -v, --verbose         explain what is being done\n"
-    "  --version             show program's version number and exit\n"
-    "\n"
-    "all trash-cli commands:\n"
-    "  trash-put             trash files and directories.\n"
-    "  trash-empty           empty the trashcan(s).\n"
-    "  trash-list            list trashed files.\n"
-    "  trash-restore         restore a trashed file.\n"
-    "  trash-rm              remove individual files from the trashcan\n"
-    "\n"
-    "To remove a file whose name starts with a '-', for example '-foo',\n"
-    "use one of these commands:\n"
-    "\n"
-    "    trash -- -foo\n"
-    "\n"
-    "    trash ./-foo\n"
-    "\n"
-    "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n";
-
 enum {
     PUT_HELP, PUT_COMPLETION, PUT_DIRECTORY, PUT_FORCE, PUT_INTERACTIVE,
-    PUT_RECURSIVE, PUT_TRASHDIR, PUT_VERBOSE, PUT_VERSION,
-    PUT_FORCE_VOLUME, PUT_HOME_FALLBACK,
+    PUT_RECURSIVE, PUT_TRASHDIR, PUT_VERBOSE, PUT_FORCE_VOLUME,
+    PUT_HOME_FALLBACK, PUT_VERSION, PUT_FILES,
 };
 
 static i32 cmd_put(Ctx *c, iz argc, Str *argv)
 {
     Arena *a = c->perm;
 
-    OptSpec specs[] = {
-        {S("help"),             S("h"),  0, {}, 0, ACT_HELP},
-        {S("print-completion"), {},      1,
-         {S("bash"), S("zsh"), S("tcsh")}, 3, ACT_COMPLETION},
-        {S("directory"),        S("d"),  0, {}, 0, ACT_NONE},
-        {S("force"),            S("f"),  0, {}, 0, ACT_NONE},
-        {S("interactive"),      S("i"),  0, {}, 0, ACT_NONE},
-        {S("recursive"),        S("rR"), 0, {}, 0, ACT_NONE},
-        {S("trash-dir"),        {},      1, {}, 0, ACT_NONE},
-        {S("verbose"),          S("v"),  0, {}, 0, ACT_NONE},
-        {S("version"),          {},      0, {}, 0, ACT_VERSION},
-        {S("force-volume"),     {},      1, {}, 0, ACT_NONE},
-        {S("home-fallback"),    {},      0, {}, 0, ACT_NONE},
+    Arg args[] = {
+        [PUT_HELP] = {.opts = {S("-h"), S("--help")}, .nopts = 2,
+                      .kind = AK_HELP, .nargs = NA_ZERO,
+                      .help = S("show this help message and exit")},
+        [PUT_COMPLETION] = {.opts = {S("--print-completion")}, .nopts = 1,
+                      .choices = {S("bash"), S("zsh"), S("tcsh")},
+                      .nchoices = 3, .kind = AK_COMPLETION, .nargs = NA_ONE,
+                      .help = S("print shell completion script")},
+        [PUT_DIRECTORY] = {.opts = {S("-d"), S("--directory")}, .nopts = 2,
+                      .kind = AK_FLAG, .nargs = NA_ZERO,
+                      .help = S("ignored (for GNU rm compatibility)")},
+        [PUT_FORCE] = {.opts = {S("-f"), S("--force")}, .nopts = 2,
+                      .kind = AK_FLAG, .nargs = NA_ZERO,
+                      .help = S("silently ignore nonexistent files")},
+        [PUT_INTERACTIVE] = {.opts = {S("-i"), S("--interactive")}, .nopts = 2,
+                      .kind = AK_FLAG, .nargs = NA_ZERO,
+                      .help = S("prompt before every removal")},
+        [PUT_RECURSIVE] = {.opts = {S("-r"), S("-R"), S("--recursive")},
+                      .nopts = 3, .kind = AK_FLAG, .nargs = NA_ZERO,
+                      .help = S("ignored (for GNU rm compatibility)")},
+        [PUT_TRASHDIR] = {.opts = {S("--trash-dir")}, .nopts = 1,
+                      .metavar = S("TRASHDIR"), .kind = AK_STORE,
+                      .nargs = NA_ONE,
+                      .help = S("use TRASHDIR as trash folder")},
+        [PUT_VERBOSE] = {.opts = {S("-v"), S("--verbose")}, .nopts = 2,
+                      .kind = AK_COUNT, .nargs = NA_ZERO,
+                      .help = S("explain what is being done")},
+        [PUT_FORCE_VOLUME] = {.opts = {S("--force-volume")}, .nopts = 1,
+                      .metavar = S("FORCED_VOLUME"), .kind = AK_STORE,
+                      .nargs = NA_ONE, .hidden = 1},
+        [PUT_HOME_FALLBACK] = {.opts = {S("--home-fallback")}, .nopts = 1,
+                      .kind = AK_FLAG, .nargs = NA_ZERO, .hidden = 1},
+        [PUT_VERSION] = {.opts = {S("--version")}, .nopts = 1,
+                      .kind = AK_VERSION, .nargs = NA_ZERO,
+                      .help = S("show program's version number and exit")},
+        [PUT_FILES] = {.metavar = S("files"), .nargs = NA_STAR},
     };
-    OptEnv e = {};
-    e.ctx          = c;
-    e.usage        = concat(a, S("usage: "), concat(a, c->prog,
-                                                    S(" [OPTION]... FILE...")));
-    e.help_usage   = concat(a, e.usage, S("\n\n"));
-    e.help_body    = import((u8 *)put_help_body);
-    e.bare_version = 1;
+    Parser pr = {
+        .usage       = S("%(prog)s [OPTION]... FILE..."),
+        .description = S("Put files in trash"),
+        .epilog      = S("all trash-cli commands:\n"
+                         "  trash-put             trash files and directories.\n"
+                         "  trash-empty           empty the trashcan(s).\n"
+                         "  trash-list            list trashed files.\n"
+                         "  trash-restore         restore a trashed file.\n"
+                         "  trash-rm              remove individual files from "
+                         "the trashcan\n"
+                         "\n"
+                         "To remove a file whose name starts with a '-', for "
+                         "example '-foo',\n"
+                         "use one of these commands:\n"
+                         "\n"
+                         "    trash -- -foo\n"
+                         "\n"
+                         "    trash ./-foo\n"
+                         "\n"
+                         "Report bugs to "
+                         "https://github.com/andreafrancia/trash-cli/issues"),
+        .rawdesc     = 1,
+        .args        = args,
+        .nargs       = (iz)countof(args),
+    };
 
     // Existing files that look like options are refused before parsing
     // (spec 5.3); everything after -- is exempt.
@@ -2462,13 +3961,13 @@ static i32 cmd_put(Ctx *c, iz argc, Str *argv)
             m = concat(a, m, S(" as an option (use './"));
             m = concat(a, m, t);
             m = concat(a, m, S("' or a '--' separator)"));
-            die_usage(&e, m);
+            ap_fail(c, &pr, m);
         }
     }
 
-    ParsedOpts p = optparse(&e, specs, (iz)countof(specs), 2, argc, argv, a);
+    ParsedOpts p = ap_parse(c, &pr, argc, argv);
     if (!p.npos) {
-        die_usage(&e, S("Please specify the files to trash."));
+        ap_fail(c, &pr, S("Please specify the files to trash."));
     }
 
     PutFlags f = {};
@@ -2478,11 +3977,14 @@ static i32 cmd_put(Ctx *c, iz argc, Str *argv)
         if (v->id == PUT_INTERACTIVE) { f.force = 0;       f.interactive = 1; }
     }
     f.force_volume = optlast(&p, PUT_FORCE_VOLUME);
+    if (!f.force_volume.len) {
+        f.force_volume = (Str){};   // empty means unset, as in Python
+    }
 
     i64 uid = os_getuid(c->os);
     Str fake = os_getenv(c->os, S("TRASH_PUT_FAKE_UID_FOR_TESTING"));
     if (fake.data) {
-        IntParsed ip = parseint(fake);
+        IntParsed ip = parseint(a, fake);
         if (!ip.ok || ip.toobig) {
             die(c, 1, S("invalid TRASH_PUT_FAKE_UID_FOR_TESTING"));
         }
@@ -2491,6 +3993,9 @@ static i32 cmd_put(Ctx *c, iz argc, Str *argv)
 
     PutEnv pe = {};
     pe.trash_dir = optlast(&p, PUT_TRASHDIR);
+    if (!pe.trash_dir.len) {
+        pe.trash_dir = (Str){};
+    }
     home_trash(c, a, &pe.home);
     pe.home_fallback = optgiven(&p, PUT_HOME_FALLBACK);
     Str fbenv = os_getenv(c->os, S("TRASH_ENABLE_HOME_FALLBACK"));
@@ -2512,32 +4017,15 @@ static i32 cmd_put(Ctx *c, iz argc, Str *argv)
 // Listing trashed files (trash-list)
 
 enum {
-    LIST_HELP, LIST_COMPLETION, LIST_VERSION, LIST_VOLUMES, LIST_TRASHDIRS,
-    LIST_TRASHDIR, LIST_ALLUSERS, LIST_SIZE, LIST_FILES, LIST_DEBUGVOLUMES,
+    LIST_HELP, LIST_COMPLETION, LIST_VERSION, LIST_DEBUGVOLUMES, LIST_VOLUMES,
+    LIST_TRASHDIRS, LIST_TRASHDIR, LIST_SIZE, LIST_FILES, LIST_ALLUSERS,
     LIST_PYTHON,
 };
 
 enum : i32 {
-    LA_LIST = 0, LA_VOLUMES, LA_TRASHDIRS, LA_SIZE, LA_FILES,
-    LA_DEBUGVOLUMES, LA_PYTHON,
+    LA_LIST = 0, LA_VERSION, LA_VOLUMES, LA_TRASHDIRS, LA_DEBUGVOLUMES,
+    LA_PYTHON,
 };
-
-static const char list_help_body[] =
-    "\n"
-    "List trashed files.\n"
-    "\n"
-    "options:\n"
-    "  -h, --help            show this help message and exit\n"
-    "  --print-completion {bash,zsh,tcsh}\n"
-    "                        print shell completion script\n"
-    "  --version             show program's version number and exit\n"
-    "  --volumes             list the volumes in the trash\n"
-    "  --trash-dirs          list the trash dirs in the volumes\n"
-    "  --trash-dir TRASH_DIRS\n"
-    "                        list only the trash dirs in this directory\n"
-    "  --all-users           list the trash cans of all the users\n"
-    "\n"
-    "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n";
 
 // Passes valid UTF-8 through and renders other bytes as \xNN escapes, the
 // way piped trash-list output shows them (spec 6.2).
@@ -2560,7 +4048,7 @@ static void printpathraw(Output *b, Str s)
 // hidden --size/--files variants.  -1 after a fatal error (an unreadable
 // info directory, or a missing backup copy under --size).
 static i32 list_entries(Ctx *c, Arena *, Arena scratch, Scan scan,
-                        i32 action, b32 quoting, b32 allusers)
+                        b32 size, b32 files, b32 quoting, b32 allusers)
 {
     Os *os = c->os;
     for (ScanEv *ev = scan.events; ev; ev = ev->next) {
@@ -2569,17 +4057,16 @@ static i32 list_entries(Ctx *c, Arena *, Arena scratch, Scan scan,
         }
         Arena td     = scratch;
         Str infodir  = join(&td, ev->path, S("info"));
-        b32 ok;
-        DirEnt *ents = os_listdir(os, &td, infodir, &ok);
-        if (!ok) {
-            i32 err = os_errno(os);
-            if (err == ENOENT) {
-                continue;   // a nonexistent trash dir contributes nothing
-            }
+        i32 state;
+        DirEnt *ents = listexisting(c, &td, infodir, &state);
+        if (state == 1) {
+            continue;   // a trash dir that is not there contributes nothing
+        }
+        if (state < 0) {
             if (allusers) {
                 continue;   // other users' trash dirs may be unreadable
             }
-            say(c, c->err, errtext(&td, os, err, infodir));
+            say(c, c->err, errtext(&td, os, -state, infodir));
             return -1;
         }
         for (DirEnt *ent = ents; ent; ent = ent->next) {
@@ -2611,20 +4098,24 @@ static i32 list_entries(Ctx *c, Arena *, Arena scratch, Scan scan,
                 continue;
             }
             Str loc = join(&te, ev->volume, ti.path);
-            if (action == LA_SIZE) {
-                Str backup = backuppath(&te, ev->path, ent->name);
-                Stat bs    = {};
+            Str backup = backuppath(&te, ev->path, ent->name);
+            if (size) {
+                // getsize(): a dangling symlink counts 0, a missing backup
+                // is fatal.
+                Stat bs = {};
                 if (!os_stat(os, te, backup, 1, &bs)) {
-                    say(c, c->err, errtext(&te, os, os_errno(os), backup));
-                    return -1;
+                    i32 err = os_errno(os);
+                    Stat ls = {};
+                    if (err == ENOENT && os_stat(os, te, backup, 0, &ls)
+                        && ls.kind == KIND_LINK) {
+                        bs.size = 0;
+                    } else {
+                        say(c, c->err, errtext(&te, os, err, backup));
+                        return -1;
+                    }
                 }
                 printi64(c->out, bs.size);
-                print(c->out, S(" "));
-                printpathraw(c->out, loc);
-                print(c->out, S("\n"));
-                continue;
-            }
-            if (ti.has_date) {
+            } else if (ti.has_date) {
                 print(c->out, fmt_date(&te, ti.date));
             } else {
                 print(c->out, S("\?\?\?\?-\?\?-\?\? ??:??:??"));
@@ -2635,9 +4126,13 @@ static i32 list_entries(Ctx *c, Arena *, Arena scratch, Scan scan,
             } else {
                 printpathraw(c->out, loc);
             }
-            if (action == LA_FILES) {
+            if (files) {
                 print(c->out, S(" -> "));
-                printpathraw(c->out, backuppath(&te, ev->path, ent->name));
+                if (quoting) {
+                    printq(c->out, backup);
+                } else {
+                    printpathraw(c->out, backup);
+                }
             }
             print(c->out, S("\n"));
         }
@@ -2648,46 +4143,67 @@ static i32 list_entries(Ctx *c, Arena *, Arena scratch, Scan scan,
 static i32 cmd_list(Ctx *c, iz argc, Str *argv)
 {
     Arena *a = c->perm;
-    OptSpec specs[] = {
-        {S("help"),             S("h"), 0, {}, 0, ACT_HELP},
-        {S("print-completion"), {},     1,
-         {S("bash"), S("zsh"), S("tcsh")}, 3, ACT_COMPLETION},
-        {S("version"),          {},     0, {}, 0, ACT_VERSION},
-        {S("volumes"),          {},     0, {}, 0, ACT_NONE},
-        {S("trash-dirs"),       {},     0, {}, 0, ACT_NONE},
-        {S("trash-dir"),        {},     1, {}, 0, ACT_NONE},
-        {S("all-users"),        {},     0, {}, 0, ACT_NONE},
-        {S("size"),             {},     0, {}, 0, ACT_NONE},
-        {S("files"),            {},     0, {}, 0, ACT_NONE},
-        {S("debug-volumes"),    {},     0, {}, 0, ACT_NONE},
-        {S("python"),           {},     0, {}, 0, ACT_NONE},
+    Arg args[] = {
+        [LIST_HELP] = {.opts = {S("-h"), S("--help")}, .nopts = 2,
+                       .kind = AK_HELP, .nargs = NA_ZERO,
+                       .help = S("show this help message and exit")},
+        [LIST_COMPLETION] = {.opts = {S("--print-completion")}, .nopts = 1,
+                       .choices = {S("bash"), S("zsh"), S("tcsh")},
+                       .nchoices = 3, .kind = AK_COMPLETION, .nargs = NA_ONE,
+                       .help = S("print shell completion script")},
+        [LIST_VERSION] = {.opts = {S("--version")}, .nopts = 1,
+                       .kind = AK_FLAG, .nargs = NA_ZERO,
+                       .help = S("show program's version number and exit")},
+        [LIST_DEBUGVOLUMES] = {.opts = {S("--debug-volumes")}, .nopts = 1,
+                       .kind = AK_FLAG, .nargs = NA_ZERO, .hidden = 1},
+        [LIST_VOLUMES] = {.opts = {S("--volumes")}, .nopts = 1,
+                       .kind = AK_FLAG, .nargs = NA_ZERO,
+                       .help = S("list volumes")},
+        [LIST_TRASHDIRS] = {.opts = {S("--trash-dirs")}, .nopts = 1,
+                       .kind = AK_FLAG, .nargs = NA_ZERO,
+                       .help = S("list trash dirs")},
+        [LIST_TRASHDIR] = {.opts = {S("--trash-dir")}, .nopts = 1,
+                       .metavar = S("TRASH_DIRS"), .kind = AK_APPEND,
+                       .nargs = NA_ONE,
+                       .help = S("specify the trash directory to use")},
+        [LIST_SIZE] = {.opts = {S("--size")}, .nopts = 1, .kind = AK_FLAG,
+                       .nargs = NA_ZERO, .hidden = 1},
+        [LIST_FILES] = {.opts = {S("--files")}, .nopts = 1, .kind = AK_FLAG,
+                       .nargs = NA_ZERO, .hidden = 1},
+        [LIST_ALLUSERS] = {.opts = {S("--all-users")}, .nopts = 1,
+                       .kind = AK_FLAG, .nargs = NA_ZERO,
+                       .help = S("list trashcans of all the users")},
+        [LIST_PYTHON] = {.opts = {S("--python")}, .nopts = 1,
+                       .kind = AK_FLAG, .nargs = NA_ZERO, .hidden = 1},
     };
-    Str usage = concat(a, S("usage: "), c->prog);
-    usage = concat(a, usage,
-                   S(" [-h] [--print-completion {bash,zsh,tcsh}] [--version]"
-                     " [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]"
-                     " [--all-users]"));
-    OptEnv e = {};
-    e.ctx        = c;
-    e.usage      = usage;
-    e.help_usage = concat(a, usage, S("\n\n"));
-    e.help_body  = import((u8 *)list_help_body);
+    Parser pr = {
+        .description = S("List trashed files"),
+        .epilog      = S("Report bugs to "
+                         "https://github.com/andreafrancia/trash-cli/issues"),
+        .args        = args,
+        .nargs       = (iz)countof(args),
+    };
 
-    ParsedOpts p = optparse(&e, specs, (iz)countof(specs), 0, argc, argv, a);
+    ParsedOpts p = ap_parse(c, &pr, argc, argv);
 
-    // The action flags share one variable: the last one wins (spec 6.1).
+    // The action flags share one variable: the last one wins (spec 6.1);
+    // --size and --files are independent switches of the main listing.
     i32 action = LA_LIST;
     for (OptVal *v = p.vals; v; v = v->next) {
         switch (v->id) {
+        case LIST_VERSION:      action = LA_VERSION;      break;
         case LIST_VOLUMES:      action = LA_VOLUMES;      break;
         case LIST_TRASHDIRS:    action = LA_TRASHDIRS;    break;
-        case LIST_SIZE:         action = LA_SIZE;         break;
-        case LIST_FILES:        action = LA_FILES;        break;
         case LIST_DEBUGVOLUMES: action = LA_DEBUGVOLUMES; break;
         case LIST_PYTHON:       action = LA_PYTHON;       break;
         }
     }
 
+    if (action == LA_VERSION) {
+        say(c, c->out, concat(a, concat(a, clone(a, c->prog), S(" ")),
+                              S("0.26.9.29")));
+        finish(c, 0);
+    }
     if (action == LA_PYTHON) {
         say(c, c->out, os_selfexe(c->os, a));
         finish(c, 0);
@@ -2724,7 +4240,9 @@ static i32 cmd_list(Ctx *c, iz argc, Str *argv)
         EvList ev = {};
         ev.tail   = &ev.head;
         for (iz k = 0; k < ntd; k++) {
-            evpush(a, &ev, EV_FOUND, optval(&p, LIST_TRASHDIR, k), S("/"));
+            Str dir = optval(&p, LIST_TRASHDIR, k);
+            evpush(a, &ev, EV_FOUND, dir,
+                   volume_of(c->os, a, c->scratch, abspath_(c, a, dir)));
         }
         Scan one = {ev.head};
         if (action == LA_TRASHDIRS) {
@@ -2735,15 +4253,16 @@ static i32 cmd_list(Ctx *c, iz argc, Str *argv)
         }
         b32 quoting = os_isatty(c->os, 1)
                    && !os_getenv(c->os, S("TRASH_RAW_OUTPUT")).data;
-        if (list_entries(c, a, c->scratch, one, action, quoting, 0)) {
+        if (list_entries(c, a, c->scratch, one, optgiven(&p, LIST_SIZE),
+                         optgiven(&p, LIST_FILES), quoting, 0)) {
             finish(c, 1);
         }
         finish(c, 0);
     }
 
     Scan s = scan_trash_dirs(c, a, c->scratch,
-                             (ScanOpts){optgiven(&p, LIST_ALLUSERS),
-                                        os_getuid(c->os)});
+                             (ScanOpts){.all_users = optgiven(&p, LIST_ALLUSERS),
+                                        .uid = os_getuid(c->os)});
     if (action == LA_TRASHDIRS) {
         // Home first (always), then the volume methods with their reasons.
         for (ScanEv *ev = s.events; ev; ev = ev->next) {
@@ -2770,7 +4289,8 @@ static i32 cmd_list(Ctx *c, iz argc, Str *argv)
     }
     b32 quoting = os_isatty(c->os, 1)
                && !os_getenv(c->os, S("TRASH_RAW_OUTPUT")).data;
-    if (list_entries(c, a, c->scratch, s, action, quoting,
+    if (list_entries(c, a, c->scratch, s, optgiven(&p, LIST_SIZE),
+                     optgiven(&p, LIST_FILES), quoting,
                      optgiven(&p, LIST_ALLUSERS))) {
         finish(c, 1);
     }
@@ -2780,29 +4300,14 @@ static i32 cmd_list(Ctx *c, iz argc, Str *argv)
 
 // Restoring trashed files (trash-restore)
 
-enum { RES_HELP, RES_COMPLETION, RES_SORT, RES_VERSION, RES_OVERWRITE,
-       RES_TRASHDIR };
-
-static const char restore_help_body[] =
-    "\n"
-    "Restore a trashed file.\n"
-    "\n"
-    "positional arguments:\n"
-    "  path                  Restore from this path (default: current dir)\n"
-    "\n"
-    "options:\n"
-    "  -h, --help            show this help message and exit\n"
-    "  --print-completion {bash,zsh,tcsh}\n"
-    "                        print shell completion script\n"
-    "  --sort {date,path,none}\n"
-    "                        sort the list by date or by path\n"
-    "  --version             show program's version number and exit\n"
-    "  --overwrite           replace existing files\n";
+enum { RES_HELP, RES_COMPLETION, RES_PATH, RES_SORT, RES_TRASHDIR,
+       RES_VERSION, RES_OVERWRITE };
 
 typedef struct {
     Str      loc;       // original location, decoded and joined
     Str      infopath;
     Str      backup;
+    Str      key;       // --sort path: location followed by the date text
     b32      has_date;
     DateTime date;
 } ResCand;
@@ -2846,9 +4351,10 @@ static b32 path_in_volume(Arena *a, Str vol, Str rel, Str *out)
     if (rel.len && rel.data[0] == '/') {
         return 0;
     }
-    Str r   = normpath(a, join(a, vol, rel));
-    Str pfx = concat(a, vol, S("/"));
-    if (!equals(r, vol) && !startswith(r, pfx)) {
+    Str nv  = normpath(a, vol);
+    Str r   = normpath(a, join(a, nv, rel));
+    Str pfx = join(a, nv, S(""));   // with the trailing slash, even for "/"
+    if (!equals(r, nv) && !startswith(r, pfx)) {
         return 0;
     }
     *out = r;
@@ -2884,134 +4390,6 @@ static b32 restore_trust_ok(Ctx *c, Arena scratch, Str td, Str *why)
     return 1;
 }
 
-// rm -r without following symlinks.  1 when the path is gone.
-static b32 rmtree(Ctx *c, Arena scratch, Str path)
-{
-    Os *os = c->os;
-    Stat st = {};
-    if (!os_stat(os, scratch, path, 0, &st)) {
-        return os_errno(os) == ENOENT;   // gone is gone
-    }
-    if (st.kind == KIND_DIR) {
-        Arena t       = scratch;
-        b32 ok;
-        DirEnt *ents  = os_listdir(os, &t, path, &ok);
-        if (ok && ents) {
-            for (DirEnt *e = ents; e; e = e->next) {
-                Arena tc = t;   // fresh: past ents, so children cannot
-                if (!rmtree(c, tc, join(&tc, path, e->name))) {   // clobber
-                    return 0;
-                }
-            }
-        }
-        return os_rmdir(os, scratch, path);
-    }
-    return os_unlink(os, scratch, path);
-}
-
-// unlink(2) with a recursive fallback, like os.remove falling back to
-// shutil.rmtree.  1 when the path is gone.
-static b32 remove_path(Ctx *c, Arena scratch, Str path)
-{
-    if (os_unlink(c->os, scratch, path)) {
-        return 1;
-    }
-    i32 err = os_errno(c->os);
-    if (err == ENOENT) {
-        return 1;
-    }
-    return rmtree(c, scratch, path);
-}
-
-// rename(2) when possible; across devices, copy and remove (shutil.move).
-static b32 move_path(Ctx *c, Arena *a, Arena scratch, Str src, Str dst,
-                     Str *preason)
-{
-    Os *os = c->os;
-    if (os_rename(os, scratch, src, dst)) {
-        return 1;
-    }
-    i32 err = os_errno(os);
-    if (err != EXDEV) {
-        *preason = errtext2(a, os, err, src, dst);
-        return 0;
-    }
-    Stat ss = {};
-    if (!os_stat(os, scratch, src, 0, &ss)) {
-        *preason = errtext(a, os, os_errno(os), src);
-        return 0;
-    }
-    if (ss.kind == KIND_LINK) {
-        Str target;
-        if (!os_readlink(os, a, src, &target)
-            || !os_symlink(os, scratch, target, dst)) {
-            *preason = errtext(a, os, os_errno(os), dst);
-            return 0;
-        }
-        os_unlink(os, scratch, src);
-        return 1;
-    }
-    if (ss.kind == KIND_DIR) {
-        if (!os_mkdir(os, scratch, dst, (u32)(ss.mode & 0777u))) {
-            *preason = errtext(a, os, os_errno(os), dst);
-            return 0;
-        }
-        b32 ok;
-        DirEnt *ents = os_listdir(os, a, src, &ok);
-        if (!ok) {
-            *preason = errtext(a, os, os_errno(os), src);
-            return 0;
-        }
-        for (DirEnt *e2 = ents; e2; e2 = e2->next) {
-            Str s2 = join(a, src, e2->name);
-            Str d2 = join(a, dst, e2->name);
-            if (!move_path(c, a, scratch, s2, d2, preason)) {
-                return 0;
-            }
-        }
-        if (!os_rmdir(os, scratch, src)) {
-            *preason = errtext(a, os, os_errno(os), src);
-            return 0;
-        }
-        return 1;
-    }
-    // Everything else: copy the bytes, keep the mode.
-    i32 in = os_open(os, scratch, src, 0, 0);
-    if (in < 0) {
-        *preason = errtext(a, os, os_errno(os), src);
-        return 0;
-    }
-    i32 out = os_open(os, scratch, dst, 1, (u32)(ss.mode & 0777u));
-    if (out < 0) {
-        os_close(os, in);
-        *preason = errtext(a, os, os_errno(os), dst);
-        return 0;
-    }
-    u8 *buf = new(a, 1 << 12, u8);
-    for (;;) {
-        iz r = os_read(os, in, buf, 1 << 12);
-        if (r < 0) {
-            os_close(os, in);
-            os_close(os, out);
-            *preason = errtext(a, os, os_errno(os), src);
-            return 0;
-        }
-        if (!r) {
-            break;
-        }
-        if (!os_write(os, out, buf, r)) {
-            os_close(os, in);
-            os_close(os, out);
-            *preason = errtext(a, os, os_errno(os), dst);
-            return 0;
-        }
-    }
-    os_close(os, in);
-    os_close(os, out);
-    os_unlink(os, scratch, src);
-    return 1;
-}
-
 // Gathers the restore candidates under `search` (spec 7.3/7.4).  Failures
 // are warnings; the exit status is decided later.
 static void restore_collect(Ctx *c, Arena *a, Arena scratch, ScanEv *dirs,
@@ -3023,19 +4401,12 @@ static void restore_collect(Ctx *c, Arena *a, Arena scratch, ScanEv *dirs,
             continue;
         }
         Arena td     = scratch;
-        Str infodir  = join(&td, ev->path, S("info"));
+        Str tdn      = normpath(&td, ev->path);
+        Str infodir  = join(&td, tdn, S("info"));
         b32 ok;
         DirEnt *ents = os_listdir(os, &td, infodir, &ok);
         if (!ok) {
-            i32 err = os_errno(os);
-            if (err == ENOENT) {
-                continue;
-            }
-            Str m =  S("TrashDir skipped because its info dir "
-                                  "cannot be read: ");
-            m = concat(&td, m, ev->path);
-            say(c, c->err, m);
-            continue;
+            continue;   // like upstream: a trash dir without a readable info/
         }
         b32 voltrash = !equals(ev->volume, S("/"))
                     && is_volume_trash(a, ev->path, ev->volume);
@@ -3045,36 +4416,39 @@ static void restore_collect(Ctx *c, Arena *a, Arena scratch, ScanEv *dirs,
                 say(c, c->err, S("Non .trashinfo file in info dir"));
                 continue;
             }
-            Str infopath = join(&te, join(&te, ev->path, S("info")),
-                                ent->name);
+            Str infopath = join(&te, infodir, ent->name);
             i32 status;
             TrashInfo ti = trashinfo_read(c, &te, te, infopath, &status);
-            if (status != TI_OK) {
-                Str why = status == TI_READERR
-                        ? errtext(&te, os, os_errno(os), infopath)
-                        : status == TI_BADUTF8
-                        ? S("the file is not valid UTF-8")
-                        : S("Unable to parse Path");
-                Str m =  S("Non parsable trashinfo file: ");
-                m = concat(&te, m, infopath);
-                m = concat(&te, m, S(", because "));
-                m = concat(&te, m, why);
-                say(c, c->err, m);
+            if (status == TI_READERR) {
+                Str err = errtext(&te, os, os_errno(os), infopath);
+                Str m = concat(&te, S("IOErrorReadingTrashInfo(path="),
+                               pyrepr(&te, infopath));
+                m = concat(&te, m, S(", error="));
+                m = concat(&te, m, pyrepr(&te, err));
+                say(c, c->err, concat(&te, m, S(")")));
                 continue;
             }
+            Str why = {};
             Str loc = {};
-            if (voltrash) {
+            if (status == TI_BADUTF8) {
+                why = ti.why;
+            } else if (status == TI_NOPATH) {
+                why = S("Unable to parse Path");
+            } else if (voltrash) {
                 if (!path_in_volume(&te, ev->volume, ti.path, &loc)) {
                     b32 abs = ti.path.len && ti.path.data[0] == '/';
-                    Str m =
-                        abs ? S("Path= must be relative for volume trashes: ")
-                            : S("Path= escapes the volume root: ");
-                    m = concat(&te, m, infopath);
-                    say(c, c->err, m);
-                    continue;
+                    why = abs ? S("Path= must be relative for volume trashes")
+                              : S("Path= escapes the volume root");
                 }
             } else {
-                loc = join(&te, ev->volume, ti.path);
+                loc = normpath(&te, join(&te, ev->volume, ti.path));
+            }
+            if (why.data) {
+                Str m = concat(&te, S("Non parsable trashinfo file: "),
+                               infopath);
+                m = concat(&te, m, S(", because "));
+                say(c, c->err, concat(&te, m, why));
+                continue;
             }
             b32 hit = equals(loc, search)
                    || equals(search, S("/"))
@@ -3085,7 +4459,7 @@ static void restore_collect(Ctx *c, Arena *a, Arena scratch, ScanEv *dirs,
             ResCand rc = {};
             rc.loc      = clone(a, loc);
             rc.infopath = clone(a, infopath);
-            rc.backup   = clone(a, backuppath(&te, ev->path, ent->name));
+            rc.backup   = clone(a, backuppath(&te, tdn, ent->name));
             rc.has_date = ti.has_date;
             rc.date     = ti.date;
             respush(out, a, rc);
@@ -3093,22 +4467,31 @@ static void restore_collect(Ctx *c, Arena *a, Arena scratch, ScanEv *dirs,
     }
 }
 
-static i32 cmpstr(Str a, Str b)
+// Orders by code point, the way Python compares str: a byte that is not
+// valid UTF-8 stands for the lone surrogate U+DC00 + byte.
+static i32 cmpchars(Str x, Str y)
 {
-    iz  m = a.len < b.len ? a.len : b.len;
-    i32 c = m ? __builtin_memcmp(a.data, b.data, (uz)m) : 0;
-    return c ? c : (i32)(a.len - b.len);
+    iz i = 0, j = 0;
+    while (i < x.len && j < y.len) {
+        iz nx = utf8_seq(x, i), ny = utf8_seq(y, j);
+        u32 cx = nx ? utf8_cp(x, i, nx) : 0xDC00u + x.data[i];
+        u32 cy = ny ? utf8_cp(y, j, ny) : 0xDC00u + y.data[j];
+        if (cx != cy) {
+            return cx < cy ? -1 : 1;
+        }
+        i += nx ? nx : 1;
+        j += ny ? ny : 1;
+    }
+    return (i < x.len) - (j < y.len);
 }
 
-// True when x sorts strictly before y; undated entries go last (the
+// True when x sorts strictly before y.  By path, that is location plus
+// date text (upstream's key); by date, undated entries go last (the
 // corrected behavior: no crash on mixed dates).
 static b32 cand_before(ResCand *x, ResCand *y, Str sort)
 {
     if (equals(sort, S("path"))) {
-        i32 c = cmpstr(x->loc, y->loc);
-        if (c) {
-            return c < 0;
-        }
+        return cmpchars(x->key, y->key) < 0;
     }
     if (x->has_date != y->has_date) {
         return x->has_date;
@@ -3119,31 +4502,146 @@ static b32 cand_before(ResCand *x, ResCand *y, Str sort)
     return 0;
 }
 
+// Stable merge sort, bottom-up, through tmp.
+static void sortcands(ResCand *arr, ResCand *tmp, iz n, Str sort)
+{
+    for (iz w = 1; w < n; w *= 2) {
+        for (iz lo = 0; lo < n; lo += 2*w) {
+            iz mid = lo + w   < n ? lo + w   : n;
+            iz hi  = lo + 2*w < n ? lo + 2*w : n;
+            iz i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                tmp[k++] = cand_before(&arr[j], &arr[i], sort) ? arr[j++]
+                                                                : arr[i++];
+            }
+            while (i < mid) {
+                tmp[k++] = arr[i++];
+            }
+            while (j < hi) {
+                tmp[k++] = arr[j++];
+            }
+        }
+        for (iz k = 0; k < n; k++) {
+            arr[k] = tmp[k];
+        }
+    }
+}
+
+// What to restore, from the prompt's answer (upstream's parse_indexes):
+// every item is parsed first, then every index is range-checked, so a bad
+// item anywhere beats an out-of-range one before it.  Dies with the
+// message.  Fills order with the selected indexes in the order asked,
+// repeats dropped.
+// A message on stderr without the program name, then exit 1: upstream's Die.
+[[noreturn]] static void bail(Ctx *c, Str msg)
+{
+    say(c, c->err, msg);
+    finish(c, 1);
+}
+
+static iz parse_selection(Ctx *c, Arena *a, Str line, iz n, iz *order)
+{
+    iz nitems = 1;
+    for (iz i = 0; i < line.len; i++) {
+        nitems += line.data[i] == ',';
+    }
+    IntParsed *lo = new(a, nitems, IntParsed);
+    IntParsed *hi = new(a, nitems, IntParsed);
+    b32       *rg = new(a, nitems, b32);
+    iz         k  = 0;
+    for (Cut it = {.tail=line, .ok=1}; it.ok; k++) {
+        it = cut(it.tail, ',');
+        Str item = it.head;
+        Cut dash = cut(item, '-');
+        Str first = dash.ok ? dash.head : item;
+        if (dash.ok) {
+            if (!first.len || !dash.tail.len) {
+                bail(c, concat(a, S("Invalid entry: open interval: "), item));
+            }
+            rg[k] = 1;
+        }
+        lo[k] = parseint(a, first);
+        if (!lo[k].ok) {
+            bail(c, concat(a, S("Invalid entry: not an index: "), first));
+        }
+        if (dash.ok) {
+            hi[k] = parseint(a, dash.tail);
+            if (!hi[k].ok) {
+                bail(c, concat(a, S("Invalid entry: not an index: "),
+                                 dash.tail));
+            }
+        }
+    }
+    u8 *seen = new(a, n, u8);
+    iz  cnt  = 0;
+    for (iz i = 0; i < nitems; i++) {
+        i64 first = lo[i].toobig ? maxof(i64) : lo[i].value;
+        i64 last  = rg[i] ? (hi[i].toobig ? maxof(i64) : hi[i].value) : first;
+        if (first > last) {
+            continue;   // an empty range selects nothing
+        }
+        if (first >= n || last >= n) {   // the first index past the end
+            Str m = S("Invalid entry: out of range 0..");
+            m = concat(a, m, istr(a, n - 1));
+            m = concat(a, m, S(": "));
+            bail(c, concat(a, m, first >= n ? lo[i].digits : istr(a, n)));
+        }
+        for (i64 v = first; v <= last; v++) {
+            if (!seen[v]) {
+                seen[v]       = 1;
+                order[cnt++]  = v;
+            }
+        }
+    }
+    return cnt;
+}
+
 static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
 {
     Arena *a = c->perm;
-    OptSpec specs[] = {
-        {S("help"),             S("h"), 0, {}, 0, ACT_HELP},
-        {S("print-completion"), {},     1,
-         {S("bash"), S("zsh"), S("tcsh")}, 3, ACT_COMPLETION},
-        {S("sort"),             {},     1,
-         {S("date"), S("path"), S("none")}, 3, ACT_NONE},
-        {S("version"),          {},     0, {}, 0, ACT_VERSION},
-        {S("overwrite"),        {},     0, {}, 0, ACT_NONE},
-        {S("trash-dir"),        {},     1, {}, 0, ACT_NONE},
+    Arg args[] = {
+        [RES_HELP] = {.opts = {S("-h"), S("--help")}, .nopts = 2,
+                      .kind = AK_HELP, .nargs = NA_ZERO,
+                      .help = S("show this help message and exit")},
+        [RES_COMPLETION] = {.opts = {S("--print-completion")}, .nopts = 1,
+                      .choices = {S("bash"), S("zsh"), S("tcsh")},
+                      .nchoices = 3, .kind = AK_COMPLETION, .nargs = NA_ONE,
+                      .help = S("print shell completion script"),
+                      .defshow = S("None")},
+        [RES_PATH] = {.metavar = S("path"), .nargs = NA_OPT,
+                      .help = S("Restore files from given path instead of "
+                                "current directory"),
+                      .defshow = S("")},
+        [RES_SORT] = {.opts = {S("--sort")}, .nopts = 1,
+                      .choices = {S("date"), S("path"), S("none")},
+                      .nchoices = 3, .kind = AK_STORE, .nargs = NA_ONE,
+                      .help = S("Sort list of restore candidates by given "
+                                "field"),
+                      .defshow = S("date")},
+        [RES_TRASHDIR] = {.opts = {S("--trash-dir")}, .nopts = 1,
+                      .metavar = S("TRASH_DIR"), .kind = AK_STORE,
+                      .nargs = NA_ONE, .hidden = 1},
+        [RES_VERSION] = {.opts = {S("--version")}, .nopts = 1,
+                      .kind = AK_FLAG, .nargs = NA_ZERO},
+        [RES_OVERWRITE] = {.opts = {S("--overwrite")}, .nopts = 1,
+                      .kind = AK_FLAG, .nargs = NA_ZERO,
+                      .help = S("Overwrite existing files with files coming "
+                                "out of the trash"),
+                      .defshow = S("False")},
     };
-    Str usage = concat(a, S("usage: "), c->prog);
-    usage = concat(a, usage,
-                   S(" [-h] [--print-completion {bash,zsh,tcsh}]"
-                     " [--sort {date,path,none}] [--version] [--overwrite]"
-                     " [path]"));
-    OptEnv e = {};
-    e.ctx        = c;
-    e.usage      = usage;
-    e.help_usage = concat(a, usage, S("\n\n"));
-    e.help_body  = import((u8 *)restore_help_body);
+    Parser pr = {
+        .description = S("Restores from trash chosen file"),
+        .defaults    = 1,
+        .args        = args,
+        .nargs       = (iz)countof(args),
+    };
 
-    ParsedOpts p = optparse(&e, specs, (iz)countof(specs), 1, argc, argv, a);
+    ParsedOpts p = ap_parse(c, &pr, argc, argv);
+    if (optgiven(&p, RES_VERSION)) {
+        say(c, c->out, concat(a, concat(a, clone(a, c->prog), S(" ")),
+                              S("0.26.9.29")));
+        finish(c, 0);
+    }
 
     Str sort = optlast(&p, RES_SORT);
     if (!sort.data) {
@@ -3151,23 +4649,27 @@ static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
     }
     b32  overwrite = optgiven(&p, RES_OVERWRITE);
     Str  trash_dir = optlast(&p, RES_TRASHDIR);
+    if (!trash_dir.len) {
+        trash_dir = (Str){};   // empty means unset, as in Python
+    }
     Str  patharg   = p.npos ? p.pos[0] : (Str){};
 
     // The search path (spec 7.3): the argument resolved against the
     // realpath of the current directory; without an argument, that
     // directory itself.
-    Str cwd    = realpath_(c->os, a, c->scratch, S("."));
+    Str cwd    = realpath_(c, a, c->scratch, S("."));
     Str search = patharg.data ? normpath(a, join(a, cwd, patharg)) : cwd;
 
     Scan s = {};
     if (trash_dir.data) {
         EvList ev = {};
         ev.tail   = &ev.head;
-        evpush(a, &ev, EV_FOUND, trash_dir, S("/"));
+        evpush(a, &ev, EV_FOUND, trash_dir,
+               volume_of(c->os, a, c->scratch, abspath_(c, a, trash_dir)));
         s.events = ev.head;
     } else {
         s = scan_trash_dirs(c, a, c->scratch,
-                            (ScanOpts){0, os_getuid(c->os)});
+                            (ScanOpts){.uid = os_getuid(c->os), .homevol = 1});
         for (ScanEv *ev = s.events; ev; ev = ev->next) {
             if (ev->kind == EV_SKIP_STICKY) {
                 say(c, c->err,
@@ -3207,16 +4709,12 @@ static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
             arr[k++] = n->c;
         }
     }
+    for (iz k = 0; k < list.n; k++) {
+        Str ds = arr[k].has_date ? fmt_date(a, arr[k].date) : S("None");
+        arr[k].key = concat(a, clone(a, arr[k].loc), ds);
+    }
     if (!equals(sort, S("none"))) {   // --sort none keeps the scan order
-        for (iz i = 1; i < list.n; i++) {   // stable insertion sort
-            ResCand t = arr[i];
-            iz j = i;
-            while (j > 0 && cand_before(&t, &arr[j-1], sort)) {
-                arr[j] = arr[j-1];
-                j--;
-            }
-            arr[j] = t;
-        }
+        sortcands(arr, new(a, list.n, ResCand), list.n, sort);
     }
 
     for (iz k = 0; k < list.n; k++) {
@@ -3228,7 +4726,7 @@ static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
             print(c->out, S("None"));
         }
         print(c->out, S(" "));
-        print(c->out, arr[k].loc);
+        printpathraw(c->out, arr[k].loc);
         print(c->out, S("\n"));
     }
     print(c->out, S("What file to restore [0.."));
@@ -3244,75 +4742,28 @@ static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
         print(c->err, S("\n"));   // exactly a blank line (spec 7.6)
         finish(c, 1);
     }
-    if (!trim(line).len) {   // empty reply: nothing is selected (spec 7.6)
+    if (!line.len) {   // empty reply: nothing is selected (spec 7.6)
         say(c, c->out, S("No files were restored"));
         finish(c, 0);
     }
 
-    u8 *sel = new(a, list.n, u8);
-    for (Cut k = {.tail=line, .ok=1}; k.ok;) {
-        k        = cut(k.tail, ',');
-        Str item = trim(k.head);
-        if (!item.len) {
-            continue;
-        }
-        Cut dash = cut(item, '-');
-        if (dash.ok) {
-            Str lo = trim(dash.head), hi = trim(dash.tail);
-            if (!lo.len || !hi.len) {
-                say(c, c->err, concat(a, S("Invalid entry: open interval: "),
-                                      item));
-                finish(c, 1);
-            }
-            IntParsed pl = parseint(lo), ph = parseint(hi);
-            if (!pl.ok || pl.toobig || pl.value < 0 || !ph.ok || ph.toobig
-                || ph.value < 0) {
-                say(c, c->err,
-                    concat(a, S("Invalid entry: not an index: "), item));
-                finish(c, 1);
-            }
-            for (i64 v = pl.value; v <= ph.value; v++) {
-                if (v >= list.n) {
-                    Str m =  S("Invalid entry: out of range 0..");
-                    m = concat(a, m, istr(a, list.n - 1));
-                    m = concat(a, m, S(": "));
-                    m = concat(a, m, item);
-                    say(c, c->err, m);
-                    finish(c, 1);
-                }
-                sel[v] = 1;
-            }
-        } else {
-            IntParsed pi = parseint(item);
-            if (!pi.ok || pi.toobig || pi.value < 0) {
-                say(c, c->err,
-                    concat(a, S("Invalid entry: not an index: "), item));
-                finish(c, 1);
-            }
-            if (pi.value >= list.n) {
-                Str m =  S("Invalid entry: out of range 0..");
-                m = concat(a, m, istr(a, list.n - 1));
-                m = concat(a, m, S(": "));
-                m = concat(a, m, item);
-                say(c, c->err, m);
-                finish(c, 1);
-            }
-            sel[pi.value] = 1;
-        }
-    }
+    iz *order = new(a, list.n, iz);
+    iz  nsel  = parse_selection(c, a, line, list.n, order);
 
-    // Restore each selected candidate in ascending order; batch errors do
+    // Restore each selected candidate in the order asked; batch errors do
     // not abort the run, but any failure makes the exit status 1 (7.7).
     b32 anyfail = 0;
-    for (iz k = 0; k < list.n; k++) {
-        if (!sel[k]) {
+    for (iz q = 0; q < nsel; q++) {
+        ResCand *cd = &arr[order[q]];
+        Str dbase = basename(cd->loc);
+        if (cd->loc.len && __builtin_memchr(cd->loc.data, 0, (uz)cd->loc.len)) {
+            say(c, c->err, S("embedded null byte"));   // Python's ValueError
+            anyfail = 1;
             continue;
         }
-        ResCand *cd = &arr[k];
-        Str dbase = basename(cd->loc);
         if (lexists(c->os, c->scratch, cd->loc)) {
             Stat ds = {};
-            os_stat(c->os, c->scratch, cd->loc, 0, &ds);
+            os_stat(c->os, c->scratch, cd->loc, 1, &ds);   // isdir follows
             if (!overwrite || ds.kind == KIND_DIR) {
                 Str m =  S("Refusing to overwrite existing file \"");
                 m = concat(a, m, dbase);
@@ -3323,26 +4774,21 @@ static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
             }
         }
         Str dp = dirname(cd->loc);
-        if (!equals(dp, S(".")) && !lexists(c->os, c->scratch, dp)) {
+        Stat dps = {};
+        b32 isdir = os_stat(c->os, c->scratch, dp, 1, &dps)
+                 && dps.kind == KIND_DIR;
+        if (!isdir) {
             i32 perr;
             Str epath;
             if (makedirs(c, c->scratch, dp, 0777, &perr, &epath)) {
-                Str m =  S("Failed to restore \"");
-                m = concat(a, m, dbase);
-                m = concat(a, m, S("\": "));
-                m = concat(a, m, errtext(a, c->os, perr, epath));
-                say(c, c->err, m);
+                say(c, c->err, errtext(a, c->os, perr, epath));
                 anyfail = 1;
                 continue;
             }
         }
         Str reason;
         if (!move_path(c, a, c->scratch, cd->backup, cd->loc, &reason)) {
-            Str m =  S("Failed to restore \"");
-            m = concat(a, m, dbase);
-            m = concat(a, m, S("\": "));
-            m = concat(a, m, reason);
-            say(c, c->err, m);
+            say(c, c->err, reason);
             anyfail = 1;
             continue;
         }
@@ -3355,31 +4801,9 @@ static i32 cmd_restore(Ctx *c, iz argc, Str *argv)
 
 enum {
     EMPTY_HELP, EMPTY_COMPLETION, EMPTY_VERSION, EMPTY_VERBOSE,
-    EMPTY_TRASHDIR, EMPTY_ALLUSERS, EMPTY_INTERACTIVE, EMPTY_FORCE,
-    EMPTY_DRYRUN, EMPTY_PRINTTIME,
+    EMPTY_TRASHDIR, EMPTY_PRINTTIME, EMPTY_ALLUSERS, EMPTY_INTERACTIVE,
+    EMPTY_FORCE, EMPTY_DRYRUN, EMPTY_DAYS,
 };
-
-static const char empty_help_body[] =
-    "\n"
-    "Purge trashed files.\n"
-    "\n"
-    "positional arguments:\n"
-    "  days                  Trashed files older than 'days' will be removed\n"
-    "\n"
-    "options:\n"
-    "  -h, --help            show this help message and exit\n"
-    "  --print-completion {bash,zsh,tcsh}\n"
-    "                        print shell completion script\n"
-    "  --version             show program's version number and exit\n"
-    "  -v, --verbose         explain what is being done\n"
-    "  --trash-dir TRASH_DIR\n"
-    "                        only empty the trash dirs in this directory\n"
-    "  --all-users           empty all the users' trash cans\n"
-    "  -i, --interactive     ask before emptying\n"
-    "  -f, --force           don't ask before emptying\n"
-    "  --dry-run             list the files that would be removed\n"
-    "\n"
-    "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n";
 
 // Removes one path (or announces the removal).  Failures are reported and
 // the loop continues; the exit status of trash-empty stays 0 (spec 8.4).
@@ -3406,14 +4830,13 @@ static void empty_one_dir(Ctx *c, Arena *, Arena scratch, Str td,
     Os *os = c->os;
     Arena t    = scratch;
     Str infodir  = join(&t, td, S("info"));
-    b32 ok;
-    DirEnt *ents = os_listdir(os, &t, infodir, &ok);
-    if (!ok) {
-        i32 err = os_errno(os);
-        if (err == ENOENT) {
-            return;
-        }
-        die(c, 1, errtext(&t, os, err, infodir));
+    i32 state;
+    DirEnt *ents = listexisting(c, &t, infodir, &state);
+    if (state == 1) {
+        return;
+    }
+    if (state < 0) {
+        die(c, 1, errtext(&t, os, -state, infodir));
     }
     for (DirEnt *e = ents; e; e = e->next) {
         if (!endswith(e->name, S(".trashinfo"))) {
@@ -3434,13 +4857,13 @@ static void empty_one_dir(Ctx *c, Arena *, Arena scratch, Str td,
                 prefixes(c, c->err, m);
                 continue;   // unparsable dates are kept
             }
-            if (!ti.has_date) {
-                continue;   // missing or invalid date: kept (spec 8.3)
-            }
-            if (fakedate.data && !faketime) {
+            if (fakedate.data && !faketime) {   // the clock is read per file
                 Str m =  S("invalid TRASH_DATE: ");
                 m = concat(&te, m, fakedate);
                 prefixes(c, c->err, m);
+            }
+            if (!ti.has_date) {
+                continue;   // missing or invalid date: kept (spec 8.3)
             }
             if (!(datetime_key(ti.date) < cutoff)) {
                 continue;   // strictly older only (spec 8.3)
@@ -3468,51 +4891,70 @@ static void empty_one_dir(Ctx *c, Arena *, Arena scratch, Str td,
 static i32 cmd_empty(Ctx *c, iz argc, Str *argv)
 {
     Arena *a = c->perm;
-    OptSpec specs[] = {
-        {S("help"),             S("h"),  0, {}, 0, ACT_HELP},
-        {S("print-completion"), {},      1,
-         {S("bash"), S("zsh"), S("tcsh")}, 3, ACT_COMPLETION},
-        {S("version"),          {},      0, {}, 0, ACT_VERSION},
-        {S("verbose"),          S("v"),  0, {}, 0, ACT_NONE},
-        {S("trash-dir"),        {},      1, {}, 0, ACT_NONE},
-        {S("all-users"),        {},      0, {}, 0, ACT_NONE},
-        {S("interactive"),      S("i"),  0, {}, 0, ACT_NONE},
-        {S("force"),            S("f"),  0, {}, 0, ACT_NONE},
-        {S("dry-run"),          {},      0, {}, 0, ACT_NONE},
-        {S("print-time"),       {},      0, {}, 0, ACT_NONE},
+    Arg args[] = {
+        [EMPTY_HELP] = {.opts = {S("-h"), S("--help")}, .nopts = 2,
+                        .kind = AK_HELP, .nargs = NA_ZERO,
+                        .help = S("show this help message and exit")},
+        [EMPTY_COMPLETION] = {.opts = {S("--print-completion")}, .nopts = 1,
+                        .choices = {S("bash"), S("zsh"), S("tcsh")},
+                        .nchoices = 3, .kind = AK_COMPLETION,
+                        .nargs = NA_ONE,
+                        .help = S("print shell completion script")},
+        [EMPTY_VERSION] = {.opts = {S("--version")}, .nopts = 1,
+                        .kind = AK_FLAG, .nargs = NA_ZERO,
+                        .help = S("show program's version number and exit")},
+        [EMPTY_VERBOSE] = {.opts = {S("-v"), S("--verbose")}, .nopts = 2,
+                        .kind = AK_COUNT, .nargs = NA_ZERO,
+                        .help = S("list files that will be deleted")},
+        [EMPTY_TRASHDIR] = {.opts = {S("--trash-dir")}, .nopts = 1,
+                        .metavar = S("TRASH_DIR"), .kind = AK_APPEND,
+                        .nargs = NA_ONE,
+                        .help = S("specify the trash directory to use")},
+        [EMPTY_PRINTTIME] = {.opts = {S("--print-time")}, .nopts = 1,
+                        .kind = AK_FLAG, .nargs = NA_ZERO, .hidden = 1},
+        [EMPTY_ALLUSERS] = {.opts = {S("--all-users")}, .nopts = 1,
+                        .kind = AK_FLAG, .nargs = NA_ZERO,
+                        .help = S("empty all trashcan of all the users")},
+        [EMPTY_INTERACTIVE] = {.opts = {S("-i"), S("--interactive")},
+                        .nopts = 2, .kind = AK_FLAG, .nargs = NA_ZERO,
+                        .help = S("ask before emptying trash directories")},
+        [EMPTY_FORCE] = {.opts = {S("-f")}, .nopts = 1, .kind = AK_FLAG,
+                        .nargs = NA_ZERO,
+                        .help = S("don't ask before emptying trash "
+                                  "directories")},
+        [EMPTY_DRYRUN] = {.opts = {S("--dry-run")}, .nopts = 1,
+                        .kind = AK_FLAG, .nargs = NA_ZERO,
+                        .help = S("show which files would have been "
+                                  "removed")},
+        [EMPTY_DAYS] = {.metavar = S("days"), .nargs = NA_OPT, .isint = 1},
     };
-    Str usage = concat(a, S("usage: "), c->prog);
-    usage = concat(a, usage,
-                   S(" [-h] [--print-completion {bash,zsh,tcsh}] [--version]"
-                     " [-v] [--trash-dir TRASH_DIR] [--all-users] [-i] [-f]"
-                     " [--dry-run] [days]"));
-    OptEnv e = {};
-    e.ctx        = c;
-    e.usage      = usage;
-    e.help_usage = concat(a, usage, S("\n\n"));
-    e.help_body  = import((u8 *)empty_help_body);
+    Parser pr = {
+        .description = S("Purge trashed files."),
+        .epilog      = S("Report bugs to "
+                         "https://github.com/andreafrancia/trash-cli/issues"),
+        .args        = args,
+        .nargs       = (iz)countof(args),
+    };
 
-    ParsedOpts p = optparse(&e, specs, (iz)countof(specs), 1, argc, argv, a);
+    ParsedOpts p = ap_parse(c, &pr, argc, argv);
+    if (optgiven(&p, EMPTY_VERSION)) {
+        say(c, c->out, concat(a, concat(a, clone(a, c->prog), S(" ")),
+                              S("0.26.9.29")));
+        finish(c, 0);
+    }
 
     b32 verbose   = optgiven(&p, EMPTY_VERBOSE);
     b32 dry       = optgiven(&p, EMPTY_DRYRUN);
     b32 all_users = optgiven(&p, EMPTY_ALLUSERS);
     i64 uid       = os_getuid(c->os);
 
-    // days (spec 8.3): parsed first, argparse-style.
+    // days (spec 8.3): already checked to be an int while parsing.
     b32 have_days = 0;
     i64 days      = 0;
     Str daysarg   = p.npos ? p.pos[0] : (Str){};
     if (daysarg.data) {
-        IntParsed pi = parseint(daysarg);
-        if (!pi.ok) {
-            Str m =  S("argument days: invalid int value: '");
-            m = concat(a, m, daysarg);
-            m = concat(a, m, S("'"));
-            die_usage(&e, m);
-        }
         have_days = 1;
-        days      = pi.value;
+        days      = parseint(a, daysarg).value;
     }
 
     // The clock: TRASH_DATE when it parses, else the real local time
@@ -3521,13 +4963,16 @@ static i32 cmd_empty(Ctx *c, iz argc, Str *argv)
     Str  fakedate = os_getenv(c->os, S("TRASH_DATE"));
     b32  faketime = 0;
     if (fakedate.data) {
-        faketime = parse_datetime(trim(fakedate), &now);
+        faketime = parse_datetime(fakedate, &now);
     }
     if (!faketime) {
         os_now(c->os, &now);
     }
 
     if (optgiven(&p, EMPTY_PRINTTIME)) {
+        if (fakedate.data && !faketime) {
+            prefixes(c, c->err, concat(a, S("invalid TRASH_DATE: "), fakedate));
+        }
         say(c, c->out, format_datetime(a, now, '-', 'T'));
         finish(c, 0);
     }
@@ -3543,10 +4988,9 @@ static i32 cmd_empty(Ctx *c, iz argc, Str *argv)
             toobig = cutoff < -62135596800LL || cutoff > 253402300799LL;
         }
         if (toobig) {
-            Str m =  S("argument days: value out of range: '");
-            m = concat(a, m, daysarg);
-            m = concat(a, m, S("'"));
-            die_usage(&e, m);
+            Str m =  S("argument days: value out of range: ");
+            m = concat(a, m, pyrepr(a, daysarg));
+            ap_fail(c, &pr, m);
         }
     }
 
@@ -3561,8 +5005,8 @@ static i32 cmd_empty(Ctx *c, iz argc, Str *argv)
         }
         s.events = ev.head;
     } else {
-        s = scan_trash_dirs(c, a, c->scratch, (ScanOpts){all_users,
-                                                         (i32)uid});
+        s = scan_trash_dirs(c, a, c->scratch, (ScanOpts){.all_users = all_users,
+                                                         .uid = (i32)uid});
     }
 
     // Interactive by default, and only ever one confirmation for all the
@@ -3574,9 +5018,7 @@ static i32 cmd_empty(Ctx *c, iz argc, Str *argv)
     }
     if (mode) {
         b32 any = 0;
-        for (ScanEv *ev = s.events; ev; ev = ev->next) {
-            any |= ev->kind == EV_FOUND;
-        }
+        any = s.events != 0;   // skipped dirs count: the list is not empty
         if (!any) {
             say(c, c->out, S("No trash directories to empty."));
             finish(c, 0);
@@ -3614,6 +5056,17 @@ static i32 cmd_empty(Ctx *c, iz argc, Str *argv)
 
 // Removing matching files from the trash (trash-rm)
 
+// "<prog>: cannot remove <path>: [Errno N] <reason>" for a failed removal.
+static void rmfailed(Ctx *c, Arena *a, Str path)
+{
+    i32 err = os_errno(c->os);
+    Str m = concat(a, S("cannot remove "), path);
+    m = concat(a, m, S(": [Errno "));
+    m = concat(a, m, istr(a, err));
+    m = concat(a, m, S("] "));
+    prefixes(c, c->err, concat(a, m, os_strerror(c->os, err)));
+}
+
 static i32 cmd_rm(Ctx *c, iz argc, Str *argv)
 {
     Arena *a = c->perm;
@@ -3632,22 +5085,22 @@ static i32 cmd_rm(Ctx *c, iz argc, Str *argv)
     Str pattern = argv[0];   // only the first argument is used (spec 9.1)
 
     Arena scratch = c->scratch;
+    b32 failed = 0;
     Scan s = scan_trash_dirs(c, a, c->scratch,
-                             (ScanOpts){0, os_getuid(c->os)});
+                             (ScanOpts){.uid = os_getuid(c->os)});
     for (ScanEv *ev = s.events; ev; ev = ev->next) {
         if (ev->kind != EV_FOUND) {
             continue;   // rejected dirs are skipped silently (spec 9.3)
         }
         Arena t      = scratch;
         Str infodir  = join(&t, ev->path, S("info"));
-        b32 ok;
-        DirEnt *ents = os_listdir(c->os, &t, infodir, &ok);
-        if (!ok) {
-            i32 err = os_errno(c->os);
-            if (err == ENOENT) {
-                continue;
-            }
-            die(c, 1, errtext(&t, c->os, err, infodir));
+        i32 state;
+        DirEnt *ents = listexisting(c, &t, infodir, &state);
+        if (state == 1) {
+            continue;
+        }
+        if (state < 0) {
+            die(c, 1, errtext(&t, c->os, -state, infodir));
         }
         for (DirEnt *e = ents; e; e = e->next) {
             if (!endswith(e->name, S(".trashinfo"))) {
@@ -3679,17 +5132,25 @@ static i32 cmd_rm(Ctx *c, iz argc, Str *argv)
             Str target = pattern.len && pattern.data[0] == '/'
                        ? loc
                        : basename(loc);
-            if (!fnmatch_(pattern, target)) {
+            if (!fnmatch_(te, pattern, target)) {
                 continue;
             }
+            // The backup copy first, then the info file; a failure is
+            // reported and, with the backup still there, the info file is
+            // left to describe it.  The run goes on and exits 1.
             Str backup = backuppath(&te, ev->path, e->name);
-            if (lexists(c->os, te, backup)) {
-                remove_path(c, te, backup);
+            if (lexists(c->os, te, backup) && !remove_path(c, te, backup)) {
+                rmfailed(c, &te, backup);
+                failed = 1;
+                continue;
             }
-            remove_path(c, te, infopath);
+            if (!remove_path(c, te, infopath)) {
+                rmfailed(c, &te, infopath);
+                failed = 1;
+            }
         }
     }
-    finish(c, 0);
+    finish(c, failed ? 1 : 0);
 }
 
 
@@ -3729,10 +5190,10 @@ typedef struct {
     die(c, 2, m);
 }
 
-// Platform Layers
+// The Linux platform layer.
 
-#if !defined(__unix__)
-#error "unsupported platform: trash needs a unix-like"
+#if !defined(__linux)
+#error "unsupported platform: trash needs Linux"
 #else
 
 // The core's basename(Str) must not collide with the libc declaration
@@ -3745,6 +5206,7 @@ typedef struct {
 #include <stdio.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -3771,6 +5233,9 @@ static char *cstr(Arena *scratch, Str path)
         __builtin_memcpy(z, path.data, n);
     }
     z[n] = 0;
+    if (n && __builtin_strlen((char *)z) != n) {
+        z[0] = 0;   // an embedded NUL names nothing: the call fails ENOENT
+    }
     return (char *)z;
 }
 
@@ -3962,7 +5427,7 @@ static DirEnt *os_listdir(Os *, Arena *a, Str path, b32 *ok)
             continue;
         }
         DirEnt *e  = new(a, 1, DirEnt);
-        e->name    = import((u8 *)de->d_name);
+        e->name    = clone(a, import((u8 *)de->d_name));   // dies with d
         *tail      = e;
         tail       = &e->next;
     }
@@ -3974,6 +5439,15 @@ static DirEnt *os_listdir(Os *, Arena *a, Str path, b32 *ok)
 static i32 os_errno(Os *)
 {
     return errno;
+}
+
+static iz os_termwidth(Os *)
+{
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) || !ws.ws_col) {
+        return 0;
+    }
+    return ws.ws_col;
 }
 
 static Str os_strerror(Os *, i32 err)
@@ -3992,15 +5466,19 @@ static Str os_selfexe(Os *os, Arena *a)
     return span(buf, buf + r);
 }
 
-static Str os_getcwd(Os *os, Arena *a)
+static Str os_getcwd(Os *, Arena *a)
 {
     for (iz cap = 1 << 8; cap <= 1 << 16; cap <<= 1) {
         u8 *buf = new(a, cap, u8);
         if (getcwd((char *)buf, (uz)cap)) {
             return span(buf, buf + strlen((char *)buf));
         }
+        if (errno != ERANGE) {
+            return (Str){};   // e.g. the directory was removed: errno is set
+        }
     }
-    oom(os);
+    errno = ENAMETOOLONG;
+    return (Str){};
 }
 
 static u64 os_rand(Os *os)
@@ -4098,12 +5576,13 @@ typedef struct {
     Arena     fs;      // every virtual allocation; rewound between tests
     VNode    *root;
     Str       mounts;  // served as /proc/self/mounts
-    VMnt      mnt[8];  // the same mounts, for st_dev emulation
+    VMnt      mnt[256]; // the same mounts, for st_dev emulation
     i32       nmnts;
     Str       cwd;
     i32       uid;     // the current user
     DateTime  now;     // the virtual clock
     b32       istty[3];
+    iz        termcols;  // the terminal's width on stdout (0: unknown)
     Str       stdinbuf;
     iz        stdinpos;
     Str       out;     // bytes written to fd 1
@@ -4256,28 +5735,6 @@ static i64 vdevof(Str path)
     return dev;
 }
 
-// Registers a mount point in both the /proc/self/mounts content (with the
-// kernel's \040 escapes) and the dev table.
-static void addmount(char *path, i64 dev)
-{
-    affirm(v->nmnts < 8);
-    Str m = import((u8 *)path);
-    Str esc = {};
-    for (iz i = 0; i < m.len; i++) {
-        if (m.data[i] == ' ') {
-            esc = concat(&v->fs, esc, S("\\040"));
-        } else {
-            esc = concat(&v->fs, esc, takehead(cuthead(m, i), 1));
-        }
-    }
-    v->mnt[v->nmnts].path = clone(&v->fs, m);
-    v->mnt[v->nmnts].dev  = dev;
-    v->nmnts++;
-    char *line = vfmt("/dev/vd%lld %s ext4 0 0\n", (long long)dev,
-                      (char *)esc.data);
-    v->mounts = concat(&v->fs, v->mounts, import((u8 *)line));
-}
-
 static VNode *vnewnode(i32 kind, u32 mode, Str name)
 {
     static i64 nextino;
@@ -4388,6 +5845,10 @@ static Str nextcomp(Str *rest)
 static b32 vwalk(Str path, b32 follow, VNode **out, Str *outpath)
 {
     v->errnum = 0;
+    if (path.len && __builtin_memchr(path.data, 0, (uz)path.len)) {
+        v->errnum = ENOENT;   // like the real layer: a NUL names nothing
+        return 0;
+    }
     path = vabs(path);
     if (!path.len || path.data[0] != '/') {
         v->errnum = ENOENT;
@@ -4594,6 +6055,10 @@ static i32 os_open(Os *os, Arena scratch, Str path, b32 create, u32 mode)
         if (!vparentof(path, &p, &base)) {
             return -1;
         }
+        if (base.len > 255) {
+            v->errnum = ENAMETOOLONG;
+            return -1;
+        }
         if (!vparentwritable(p)) {
             return -1;
         }
@@ -4763,6 +6228,10 @@ static b32 os_rename(Os *os, Arena scratch, Str from, Str to)
         v->errnum = ENOENT;
         return 0;
     }
+    if (vdevof(vabs(from)) != vdevof(vabs(to))) {
+        v->errnum = EXDEV;
+        return 0;
+    }
     // Kernel rename semantics for an existing destination: a file replaces
     // a file, a directory replaces an empty directory, all else fails.
     VNode *victim = vfindin(tp, tbase);
@@ -4897,7 +6366,7 @@ static DirEnt *os_listdir(Os *os, Arena *a, Str path, b32 *ok)
     DirEnt **tail = &head;
     for (VNode *k = n->kids; k; k = k->next) {
         DirEnt *e = new(a, 1, DirEnt);
-        e->name = k->name;
+        e->name = clone(a, k->name);   // like the real layer: names live in *a
         *tail   = e;
         tail    = &e->next;
     }
@@ -4909,6 +6378,12 @@ static i32 os_errno(Os *os)
 {
     (void)os;
     return v->errnum;
+}
+
+static iz os_termwidth(Os *os)
+{
+    (void)os;
+    return v->istty[1] ? v->termcols : 0;
 }
 
 static Str os_strerror(Os *os, i32 err)
@@ -4942,6 +6417,10 @@ static Str os_getcwd(Os *os, Arena *a)
 {
     (void)os;
     (void)a;
+    if (!v->cwd.len) {   // a deleted working directory
+        v->errnum = ENOENT;
+        return (Str){};
+    }
     return v->cwd;
 }
 
@@ -5005,6 +6484,29 @@ static void vwriter(char *path, Str bytes, u32 mode)
 static void vwrite(char *path, char *bytes)
 {
     vwriter(path, import((u8 *)bytes), 0644);
+}
+
+// Registers a mount point in both the /proc/self/mounts content (with the
+// kernel's \040 escapes) and the dev table.
+static void addmount(char *path, i64 dev)
+{
+    affirm(v->nmnts < 256);
+    Str m = import((u8 *)path);
+    Str esc = {};
+    for (iz i = 0; i < m.len; i++) {
+        if (m.data[i] == ' ') {
+            esc = concat(&v->fs, esc, S("\\040"));
+        } else {
+            esc = concat(&v->fs, esc, takehead(cuthead(m, i), 1));
+        }
+    }
+    v->mnt[v->nmnts].path = clone(&v->fs, m);
+    v->mnt[v->nmnts].dev  = dev;
+    v->nmnts++;
+    char *line = vfmt("/dev/vd%lld %.*s ext4 0 0\n", (long long)dev,
+                      (int)esc.len, (char *)esc.data);
+    v->mounts = concat(&v->fs, v->mounts, import((u8 *)line));
+    vwriter("/proc/self/mounts", v->mounts, 0444);
 }
 
 static void vsymlink(char *target, char *path)
@@ -5346,6 +6848,7 @@ static void newsandbox(void)
     v->cwd    = S("/work");
     v->mounts = S("/dev/vda / ext4 0 0\n");
     v->root   = vnewnode(KIND_DIR, 0755, S(""));
+    vwriter("/proc/self/mounts", v->mounts, 0444);
     vmkdir("/home");
     vmkdir("/xdg");
     vmkdir("/work");
@@ -5543,6 +7046,60 @@ static void newsandbox(void)
     X(mounts_octal_escapes) \
     X(rename_fixup_restores_mode) \
     X(home_fallback_candidate) \
+    X(rm_removes_nested_directory_completely) \
+    X(empty_removes_nested_directory_completely) \
+    X(put_through_symlink_with_deep_target) \
+    X(put_trash_dir_through_deep_symlink) \
+    X(volumes_beyond_sixty_four_are_scanned) \
+    X(restore_in_deleted_cwd_fails_cleanly) \
+    X(put_retries_next_suffix_when_info_exists) \
+    X(put_hard_info_error_is_reported) \
+    X(put_move_error_reports_the_copy_failure) \
+    X(put_across_devices_copies_and_removes) \
+    X(put_vv_shows_each_candidates_volume) \
+    X(put_root_volume_paths_have_no_double_slash) \
+    X(put_empty_trash_dir_and_force_volume_are_unset) \
+    X(put_interactive_prompt_precedes_permission_check) \
+    X(put_message_escapes_invalid_utf8) \
+    X(put_parents_of_trash_dir_follow_the_umask) \
+    X(put_long_name_retries_with_first_suffix) \
+    X(put_vv_logs_failed_info_attempts) \
+    X(list_trash_dir_uses_its_volume) \
+    X(restore_trash_dir_uses_its_volume) \
+    X(restore_home_trash_on_a_mount_uses_the_mount_point) \
+    X(restore_sort_path_uses_location_plus_date) \
+    X(restore_sort_is_stable_over_many_entries) \
+    X(restore_normalizes_path) \
+    X(restore_volume_with_trailing_slash) \
+    X(list_size_and_files_are_independent) \
+    X(list_size_of_dangling_backup_is_zero) \
+    X(list_tty_quoting_follows_upstream) \
+    X(restore_overwrite_refuses_symlink_to_directory) \
+    X(restore_prompt_grammar_errors) \
+    X(restore_prompt_restores_in_order_asked_without_repeats) \
+    X(restore_errors_have_no_prefix) \
+    X(restore_prompt_carriage_return_is_not_empty) \
+    X(restore_reports_undecodable_trashinfo_like_python) \
+    X(restore_listing_escapes_invalid_bytes) \
+    X(restore_reports_unreadable_trashinfo_like_python) \
+    X(restore_overwrite_across_devices) \
+    X(rm_star_pattern_matches_names_containing_a_star) \
+    X(rm_matches_characters_not_bytes) \
+    X(rm_reports_removal_failures_and_exits_1) \
+    X(empty_rm_and_list_skip_a_trash_dir_behind_an_unreadable_parent) \
+    X(empty_warns_about_a_bad_trash_date_per_trashinfo) \
+    X(empty_print_time_warns_about_a_bad_trash_date) \
+    X(deletion_dates_follow_strptime) \
+    X(days_follows_python_int) \
+    X(trash_date_follows_strptime_and_is_not_trimmed) \
+    X(trashinfo_lines_end_at_any_newline_style) \
+    X(restore_refuses_a_path_with_an_embedded_nul) \
+    X(argparse_output_matches_python) \
+    X(argparse_option_value_cannot_look_like_an_option) \
+    X(argparse_clusters_and_explicit_arguments) \
+    X(argparse_negative_numbers_and_separator) \
+    X(argparse_errors_come_in_argparse_order) \
+    X(argparse_width_follows_columns_then_the_terminal) \
     X(smoke_list_shows_entry)
 
 #define X(n) static void test_##n(void);
@@ -6325,6 +7882,11 @@ static void test_accepted_but_ignored_rm_flags(void)
 // -- Section 6: trash-list (spec 6.2, 6.3) ---------------------------------------
 
 // '<n> <YYYY-MM-DD HH:MM:SS|None> <path>' -> path, per spec 7.5.
+static i32 cmpstr_test(Str a, Str b)
+{
+    return namecmp(a, b);
+}
+
 static Str linepath_restore(Str line)
 {
     iz i = 0;
@@ -7743,6 +9305,1538 @@ static void test_rm_dangling_backup_copy_is_removed(void)
     CK_EQ(vlist("/xdg/Trash/info", names), 0);
 }
 
+// -- Review fixes: memory safety and crashes ---------------------------------
+
+// A trashed directory with several nested subdirectories: the recursive
+// removal must hold on to every sibling name while it descends.
+static void nested_dir(char *trash, char *stem)
+{
+    mktrash(trash);
+    winfo(trash, stem, vfmt("/work/%s", stem), (char *)0, (Str){});
+    char *names[] = {"alpha", "bravo", "charlie", "delta", "echo", "foxtrot",
+                     "golf"};
+    for (uz i = 0; i < countof(names); i++) {
+        vwrite(vfmt("%s/files/%s/%s/inner/deep/f", trash, stem, names[i]), "x");
+        vwrite(vfmt("%s/files/%s/%s/g", trash, stem, names[i]), "y");
+    }
+}
+
+static void test_rm_removes_nested_directory_completely(void)
+{
+    nested_dir("/xdg/Trash", "D");
+    Res r = trm("D");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_gone("/xdg/Trash/files/D");
+    ck_gone("/xdg/Trash/info/D.trashinfo");
+}
+
+static void test_empty_removes_nested_directory_completely(void)
+{
+    nested_dir("/xdg/Trash", "D");
+    Res r = tempty("-f");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_gone("/xdg/Trash/files/D");
+    ck_gone("/xdg/Trash/info/D.trashinfo");
+}
+
+// A symlink whose target has more components than the path using it.
+static void test_put_through_symlink_with_deep_target(void)
+{
+    vmkdir("/deep/a/b/c/d/e/f/g/h/i/j/k/l");
+    vsymlink("/deep/a/b/c/d/e/f/g/h/i/j/k/l", "/work/l2");
+    vwrite("/deep/a/b/c/d/e/f/g/h/i/j/k/l/file", "data");
+    Res r = tput("l2/file");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_gone("/deep/a/b/c/d/e/f/g/h/i/j/k/l/file");
+    ck_present("/xdg/Trash/files/file");
+    Str info = vread("/xdg/Trash/info/file.trashinfo");
+    CK_HAS(info, "Path=/deep/a/b/c/d/e/f/g/h/i/j/k/l/file\n");
+}
+
+static void test_put_trash_dir_through_deep_symlink(void)
+{
+    vmkdir("/deep/a/b/c/d/e/f/g/h/i/j/k/l/t");
+    vsymlink("/deep/a/b/c/d/e/f/g/h/i/j/k/l", "/work/l2");
+    vwrite("/work/file", "data");
+    Res r = tput("--trash-dir", "l2/t", "file");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_present("/deep/a/b/c/d/e/f/g/h/i/j/k/l/t/files/file");
+}
+
+// The 64-volume cap is gone: a trash dir on the 150th mount is found.
+static void test_volumes_beyond_sixty_four_are_scanned(void)
+{
+    envdel("TRASH_VOLUMES");
+    for (i32 i = 0; i < 200; i++) {
+        char *m = vfmt("/m%d", i);
+        vmkdir(m);
+        addmount(m, 10 + i);
+    }
+    addmount("/m7", 99);   // a duplicate mount point is listed once
+    mktrash("/m150/.Trash-1000");
+    make_trashed("/m150/.Trash-1000", "far", "far", "2001-02-03T04:05:06");
+    Res r = tlist("--volumes");
+    CK_EQ(r.exit, 0);
+    iz lines = 0;
+    for (iz i = 0; i < r.out.len; i++) {
+        lines += r.out.data[i] == '\n';
+    }
+    CK_EQ(lines, 201);   // "/" and 200 mounts
+    CK_HAS(r.out, "/m199\n");
+    r = tlist();
+    CK_EQ(r.exit, 0);
+    CK_S(r.out, S("2001-02-03 04:05:06 /m150/far\n"));
+}
+
+static void test_restore_in_deleted_cwd_fails_cleanly(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "a", "/work/a", "2001-02-03T04:05:06");
+    setcwd("");
+    Res r = trestore();
+    CK_EQ(r.exit, 1);
+    CK_S(r.err, S("trash-restore: [Errno 2] No such file or directory\n"));
+    CK_S(r.out, S(""));
+}
+
+// -- Review fixes: trash-put ---------------------------------------------------
+
+static void test_put_retries_next_suffix_when_info_exists(void)
+{
+    // A stale info file (no backup copy), or anything else already holding
+    // the name, only sends the search on to the next suffix.
+    mktrash("/xdg/Trash");
+    winfo("/xdg/Trash", "f", "/elsewhere/f", (char *)0, (Str){});
+    vmkdir("/xdg/Trash/info/g.trashinfo");
+    vwrite("/work/f", "one");
+    vwrite("/work/g", "two");
+    Res r = tput("f", "g");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_contents("/xdg/Trash/files/f_1", "one");
+    ck_contents("/xdg/Trash/files/g_1", "two");
+    ck_present("/xdg/Trash/info/f_1.trashinfo");
+    ck_present("/xdg/Trash/info/g_1.trashinfo");
+}
+
+static void test_put_hard_info_error_is_reported(void)
+{
+    // EACCES cannot be fixed by another name: stop, with upstream's words.
+    mktrash("/xdg/Trash");
+    vchmod("/xdg/Trash/info", 0500);
+    vchmod("/", 0555);   // no .Trash-1000 on the root volume to fall back on
+    vwrite("/work/f", "one");
+    Res r = tput("f");
+    CK_EQ(r.exit, 74);
+    CK_HAS(r.err, "failed to create trashinfo file: [Errno 13] Permission "
+                  "denied: '/xdg/Trash/info/f.trashinfo'");
+    ck_present("/work/f");
+}
+
+static void test_put_move_error_reports_the_copy_failure(void)
+{
+    // The rename fails, the fallback copy fails on the destination: that
+    // error is the one reported, with the errno the kernel gave.
+    mktrash("/xdg/Trash");
+    vchmod("/xdg/Trash/files", 0500);
+    vchmod("/", 0555);
+    vwrite("/work/f", "one");
+    Res r = tput("f");
+    CK_EQ(r.exit, 74);
+    CK_HAS(r.err, "failed to move f in /xdg/Trash/files: [Errno 13] "
+                  "Permission denied: '/xdg/Trash/files/f'");
+    ck_present("/work/f");
+    ck_gone("/xdg/Trash/info/f.trashinfo");
+}
+
+static void test_put_across_devices_copies_and_removes(void)
+{
+    // rename(2) says EXDEV; shutil.move copies then removes the original.
+    addmount("/vol", 2);
+    vwrite("/vol/f", "data");
+    vwrite("/vol/d/sub/x", "deep");
+    vsymlink("/target", "/vol/lnk");
+    Res r = tput("--force-volume", "/", "/vol/f", "/vol/d", "/vol/lnk");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_gone("/vol/f");
+    ck_gone("/vol/d");
+    ck_gone("/vol/lnk");
+    ck_contents("/xdg/Trash/files/f", "data");
+    ck_contents("/xdg/Trash/files/d/sub/x", "deep");
+    CK_S(vlinkto("/xdg/Trash/files/lnk"), S("/target"));
+}
+
+static void test_put_vv_shows_each_candidates_volume(void)
+{
+    addmount("/vol", 2);
+    vwrite("/vol/f", "x");
+    Res r = tput("-vv", "--force-volume", "/vol", "/vol/f");
+    CK_EQ(r.exit, 0);
+    // the home trash lives on "/", the method candidates on the file's volume
+    CK_HAS(r.err, "trying trash dir: /xdg/Trash from volume: /\n");
+    vwrite("/vol/f2", "x");
+    r = tput("-vv", "--trash-dir", "/vol/mytrash", "/vol/f2");
+    CK_HAS(r.err, "trying trash dir: /vol/mytrash from volume: /vol\n");
+    // normalized, as upstream prints it
+    vwrite("/work/g", "x");
+    envset("XDG_DATA_HOME", "/xdg/");
+    r = tput("-vv", "g");
+    CK_HAS(r.err, "trying trash dir: /xdg/Trash from volume: /\n");
+}
+
+static void test_put_root_volume_paths_have_no_double_slash(void)
+{
+    envdel("XDG_DATA_HOME");
+    envdel("HOME");
+    vwrite("/work/f", "x");
+    Res r = tput("-vv", "--force-volume", "/", "f");
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.err, "trying trash dir: /.Trash/1000 from volume: /\n");
+    CK_NOHAS(r.err, "//");
+    ck_present("/.Trash-1000/files/f");
+    Res v = tput("-v", "--force-volume", "/", "f");
+    CK_HAS(v.err, "cannot trash non existent 'f'");
+}
+
+static void test_put_empty_trash_dir_and_force_volume_are_unset(void)
+{
+    vwrite("/work/f", "x");
+    vwrite("/work/g", "x");
+    Res r = tput("--trash-dir", "", "f");
+    CK_EQ(r.exit, 0);
+    ck_present("/xdg/Trash/files/f");
+    r = tput("--force-volume", "", "g");
+    CK_EQ(r.exit, 0);
+    ck_present("/xdg/Trash/files/g");
+}
+
+static void test_put_interactive_prompt_precedes_permission_check(void)
+{
+    vwrite("/work/ro/g", "x");
+    vchmod("/work/ro", 0555);
+    setstdin("y\n");
+    Res r = tput("-i", "ro/g");
+    CK_EQ(r.exit, 74);
+    CK_HAS(r.out, "trash-put: trash regular file 'ro/g'? ");
+    CK_HAS(r.err, "cannot trash regular file 'ro/g' because deleting it is "
+                  "not allowed");
+}
+
+static void test_put_message_escapes_invalid_utf8(void)
+{
+    // stderr shows undecodable bytes the way Python's surrogateescape does.
+    Res r = tput("bad\xff" "name");
+    CK_EQ(r.exit, 74);
+    CK_HAS(r.err, "cannot trash non existent 'bad\\udcffname'");
+}
+
+static void test_put_parents_of_trash_dir_follow_the_umask(void)
+{
+    envdel("XDG_DATA_HOME");
+    vwrite("/work/f", "x");
+    Res r = tput("f");
+    CK_EQ(r.exit, 0);
+    // only the leaf is private; the parents get the default mode
+    ck_mode("/home/.local", 0777);
+    ck_mode("/home/.local/share", 0777);
+    ck_mode("/home/.local/share/Trash", 0700);
+    ck_mode("/home/.local/share/Trash/files", 0700);
+}
+
+static void test_put_long_name_retries_with_first_suffix(void)
+{
+    char name[256];
+    for (i32 i = 0; i < 255; i++) {
+        name[i] = 'a';
+    }
+    name[255] = 0;
+    vwrite(vfmt("/work/%s", name), "x");
+    Res r = tput(name);
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    char stem[256];
+    for (i32 i = 0; i < 243; i++) {
+        stem[i] = 'a';
+    }
+    stem[243] = 0;
+    ck_present(vfmt("/xdg/Trash/files/%s_1", stem));
+    ck_present(vfmt("/xdg/Trash/info/%s_1.trashinfo", stem));
+}
+
+static void test_put_vv_logs_failed_info_attempts(void)
+{
+    mktrash("/xdg/Trash");
+    winfo("/xdg/Trash", "f", "/elsewhere/f", (char *)0, (Str){});
+    vwrite("/work/f", "x");
+    Res r = tput("-vv", "f");
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.err, "attempt for creating /xdg/Trash/info/f.trashinfo failed.");
+    CK_HAS(r.err, ".trashinfo created as /xdg/Trash/info/f_1.trashinfo.");
+}
+
+// -- Review fixes: trash-list and trash-restore ---------------------------------
+
+static void test_list_trash_dir_uses_its_volume(void)
+{
+    // put records a volume-relative Path=; the listing joins it back.
+    addmount("/vol", 2);
+    vwrite("/vol/agt/sub/g", "x");
+    CK_EQ(tput("--trash-dir", "/vol/.Trash-1000", "/vol/agt/sub/g").exit, 0);
+    CK_HAS(vread("/vol/.Trash-1000/info/g.trashinfo"), "Path=agt/sub/g\n");
+    Res r = tlist("--trash-dir", "/vol/.Trash-1000");
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.out, " /vol/agt/sub/g\n");
+}
+
+static void test_restore_trash_dir_uses_its_volume(void)
+{
+    addmount("/vol", 2);
+    vwrite("/vol/agt/sub/g", "x");
+    CK_EQ(tput("--trash-dir", "/vol/.Trash-1000", "/vol/agt/sub/g").exit, 0);
+    ck_gone("/vol/agt/sub/g");
+    setstdin("0\n");
+    Res r = trestore("--trash-dir", "/vol/.Trash-1000", "/");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    CK_HAS(r.out, " /vol/agt/sub/g\n");
+    ck_contents("/vol/agt/sub/g", "x");
+}
+
+static void test_restore_home_trash_on_a_mount_uses_the_mount_point(void)
+{
+    // upstream restore joins the home trash's relative Path= with the home
+    // trash's volume; trash-list uses "/" for it (both reproduced).
+    addmount("/vol", 2);
+    envset("XDG_DATA_HOME", "/vol/h");
+    mktrash("/vol/h/Trash");
+    make_trashed("/vol/h/Trash", "r", "rel/h", "2001-02-03T04:05:06");
+    Res r = tlist();
+    CK_HAS(r.out, "2001-02-03 04:05:06 /rel/h\n");
+    setcwd("/vol");
+    setstdin("\n");
+    r = trestore();
+    CK_HAS(r.out, "   0 2001-02-03 04:05:06 /vol/rel/h\n");
+}
+
+static void test_restore_sort_path_uses_location_plus_date(void)
+{
+    // upstream sorts on original_location + str(date): " " < "." < "2"
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "p1", "/work/a", "2001-01-01T00:00:00");
+    make_trashed("/xdg/Trash", "p2", "/work/a.txt", "2001-01-01T00:00:00");
+    make_trashed("/xdg/Trash", "p3", "/work/a b", "2001-01-01T00:00:00");
+    setstdin("\n");
+    Res r = trestore("--sort", "path");
+    CK_EQ(r.exit, 0);
+    Str lines[32];
+    iz n = vlines(r.out, lines);
+    CK_EQ(n, 4);
+    CK_S(linepath_restore(lines[0]), S("/work/a b"));
+    CK_S(linepath_restore(lines[1]), S("/work/a.txt"));
+    CK_S(linepath_restore(lines[2]), S("/work/a"));
+}
+
+static void test_restore_sort_is_stable_over_many_entries(void)
+{
+    mktrash("/xdg/Trash");
+    for (i32 i = 0; i < 100; i++) {
+        make_trashed("/xdg/Trash", vfmt("e%03d", i), vfmt("/work/f%03d", i),
+                     vfmt("2001-01-%02dT00:00:00", 1 + (i * 7) % 28));
+    }
+    setstdin("\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 0);
+    Str lines[128];
+    Str rest = r.out;
+    iz n = 0;
+    for (;;) {
+        Cut ln = cut(rest, '\n');
+        if (!ln.ok) {
+            break;
+        }
+        CK(n < 128);
+        lines[n++] = ln.head;
+        rest = ln.tail;
+    }
+    CK_EQ(n, 101);   // 100 entries, then "No files were restored"
+    for (iz i = 1; i < 100; i++) {
+        Str d0 = takehead(cuthead(lines[i-1], 5), 10);
+        Str d1 = takehead(cuthead(lines[i], 5), 10);
+        CK(cmpstr_test(d0, d1) <= 0);
+    }
+}
+
+static void test_restore_normalizes_path(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "d1", "/work/d/", "2001-01-01T00:00:00");
+    make_trashed("/xdg/Trash", "d2", "/work/d/../d4", "2001-01-01T00:00:00");
+    setstdin("\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.out, " /work/d\n");
+    CK_HAS(r.out, " /work/d4\n");
+    CK_NOHAS(r.out, "/work/d/");
+    r = trestore("/work/d4");
+    CK_HAS(r.out, " /work/d4\n");
+}
+
+static void test_restore_volume_with_trailing_slash(void)
+{
+    envset("TRASH_VOLUMES", "/vol/");
+    mktrash("/vol/.Trash-1000");
+    make_trashed("/vol/.Trash-1000", "v", "work/v", "2001-01-01T00:00:00");
+    Res r = tlist("--trash-dirs");
+    CK_HAS(r.out, "/vol/.Trash-1000\n");
+    CK_NOHAS(r.out, "//");
+    setcwd("/vol/work");
+    setstdin("\n");
+    r = trestore();
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    CK_HAS(r.out, " /vol/work/v\n");
+}
+
+static void test_list_size_and_files_are_independent(void)
+{
+    mktrash("/trash");
+    winfo("/trash", "s", "/work/s", "2001-02-03T04:05:06", (Str){});
+    wbackup("/trash", "s", "12345");
+    Res r = tlist("--trash-dir", "/trash", "--size");
+    CK_S(r.out, S("5 /work/s\n"));
+    r = tlist("--trash-dir", "/trash", "--files");
+    CK_S(r.out, S("2001-02-03 04:05:06 /work/s -> /trash/files/s\n"));
+    r = tlist("--trash-dir", "/trash", "--size", "--files");
+    CK_S(r.out, S("5 /work/s -> /trash/files/s\n"));
+    r = tlist("--trash-dir", "/trash", "--files", "--size");
+    CK_S(r.out, S("5 /work/s -> /trash/files/s\n"));
+}
+
+static void test_list_size_of_dangling_backup_is_zero(void)
+{
+    mktrash("/trash");
+    winfo("/trash", "d", "/work/d", "2001-02-03T04:05:06", (Str){});
+    vsymlink("/gone", "/trash/files/d");
+    Res r = tlist("--trash-dir", "/trash", "--size");
+    CK_EQ(r.exit, 0);
+    CK_S(r.out, S("0 /work/d\n"));
+    // a backup that is not even a symlink is fatal
+    winfo("/trash", "m", "/work/m", "2001-02-03T04:05:06", (Str){});
+    r = tlist("--trash-dir", "/trash", "--size");
+    CK_EQ(r.exit, 1);
+}
+
+static void test_list_tty_quoting_follows_upstream(void)
+{
+    v->istty[1] = 1;
+    mktrash("/trash");
+    make_trashed("/trash", "q1", "/work/caf\xc3\xa9", "2001-01-01T00:00:00");
+    make_trashed("/trash", "q2", "/work/a%0Ab", "2001-01-01T00:00:00");
+    make_trashed("/trash", "q3", "/work/it's", "2001-01-01T00:00:00");
+    make_trashed("/trash", "q4", "/work/x%y+z", "2001-01-01T00:00:00");
+    make_trashed("/trash", "q5", "/work/a%FFb", "2001-01-01T00:00:00");
+    make_trashed("/trash", "q6", "/work/tab\there", "2001-01-01T00:00:00");
+    Res r = tlist("--trash-dir", "/trash");
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.out, " '/work/caf\xc3\xa9'\n");
+    CK_HAS(r.out, " '/work/a'$'\\n''b'\n");
+    CK_HAS(r.out, " '/work/it'\\''s'\n");
+    CK_HAS(r.out, " /work/x%y+z\n");
+    CK_HAS(r.out, " '/work/a'$'\\xff''b'\n");
+    CK_HAS(r.out, " '/work/tab'$'\\t''here'\n");
+}
+
+static void test_restore_overwrite_refuses_symlink_to_directory(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "t", "/work/t", "2001-01-01T00:00:00");
+    vmkdir("/somedir");
+    vsymlink("/somedir", "/work/t");
+    setstdin("0\n");
+    Res r = trestore("--overwrite");
+    CK_EQ(r.exit, 1);
+    CK_HAS(r.err, "Refusing to overwrite existing file \"t\".");
+    CK_S(vlinkto("/work/t"), S("/somedir"));
+}
+
+static void test_restore_prompt_grammar_errors(void)
+{
+    mktrash("/xdg/Trash");
+    for (i32 i = 0; i < 3; i++) {
+        make_trashed("/xdg/Trash", vfmt("g%d", i), vfmt("/work/g%d", i),
+                     vfmt("2001-01-0%dT00:00:00", i + 1));
+    }
+    struct { char *in, *err; } cases[] = {
+        {"1,\n",       "Invalid entry: not an index: \n"},
+        {"1,,2\n",     "Invalid entry: not an index: \n"},
+        {"  \n",       "Invalid entry: not an index:   \n"},
+        {"1-9\n",      "Invalid entry: out of range 0..2: 3\n"},
+        {"1-2-3\n",    "Invalid entry: not an index: 2-3\n"},
+        {"x,9\n",      "Invalid entry: not an index: x\n"},
+        {"9,x\n",      "Invalid entry: not an index: x\n"},
+        {"-1\n",       "Invalid entry: open interval: -1\n"},
+        {" 1-\n",      "Invalid entry: open interval:  1-\n"},
+        {"007\n",      "Invalid entry: out of range 0..2: 7\n"},
+        {"99999999999999999999999\n",
+                       "Invalid entry: out of range 0..2: 99999999999999999999999\n"},
+        {"1 - 2\n",    "Invalid entry: out of range"},   // int() trims: 1..2 ok?
+    };
+    for (uz i = 0; i + 1 < countof(cases); i++) {
+        setstdin(cases[i].in);
+        Res r = trestore();
+        CK_EQ(r.exit, 1);
+        CK_S(r.err, import((u8 *)cases[i].err));
+    }
+    // int() tolerates whitespace, signs, underscores and other scripts
+    setstdin(" +1_0 \n");
+    Res r = trestore();
+    CK_S(r.err, S("Invalid entry: out of range 0..2: 10\n"));
+    setstdin("\xd9\xa1\n");   // ARABIC-INDIC DIGIT ONE
+    r = trestore();
+    CK_EQ(r.exit, 0);
+    ck_present("/work/g1");
+}
+
+static void test_restore_prompt_restores_in_order_asked_without_repeats(void)
+{
+    mktrash("/xdg/Trash");
+    for (i32 i = 0; i < 3; i++) {
+        make_trashed("/xdg/Trash", vfmt("o%d", i), vfmt("/work/o%d", i),
+                     vfmt("2001-01-0%dT00:00:00", i + 1));
+        vwrite(vfmt("/work/o%d", i), "in the way");
+    }
+    setstdin("2,0,2,1-2\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 1);
+    CK_S(r.err, S("Refusing to overwrite existing file \"o2\".\n"
+                  "Refusing to overwrite existing file \"o0\".\n"
+                  "Refusing to overwrite existing file \"o1\".\n"));
+    // an empty range selects nothing
+    setstdin("2-1\n");
+    r = trestore();
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+}
+
+static void test_restore_errors_have_no_prefix(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "n", "/ro/n", "2001-01-01T00:00:00");
+    vmkdir("/ro");
+    vchmod("/ro", 0555);
+    setcwd("/ro");
+    setstdin("0\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 1);
+    CK_S(r.err, S("[Errno 13] Permission denied: '/ro/n'\n"));
+    ck_present("/xdg/Trash/info/n.trashinfo");
+    // a file where a directory should be: makedirs' own error
+    vwrite("/blocker", "x");
+    make_trashed("/xdg/Trash", "m", "/blocker/sub/m", "2001-01-02T00:00:00");
+    setcwd("/blocker");
+    setstdin("0\n");
+    r = trestore();
+    CK_EQ(r.exit, 1);
+    CK_HAS(r.err, "[Errno 20] Not a directory: '/blocker/sub'");
+}
+
+static void test_restore_prompt_carriage_return_is_not_empty(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "c", "/work/c", "2001-01-01T00:00:00");
+    setstdin("\r\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 1);
+    CK_S(r.err, S("Invalid entry: not an index: \r\n"));
+    setstdin("0\r\n");   // int() trims the \r
+    r = trestore();
+    CK_EQ(r.exit, 0);
+    ck_present("/work/c");
+}
+
+static void test_restore_reports_undecodable_trashinfo_like_python(void)
+{
+    mktrash("/xdg/Trash");
+    winfo("/xdg/Trash", "bad", (char *)0, (char *)0,
+          (Str){(u8 *)"[Trash Info]\nPath=/x\xff\n", 21});
+    winfo("/xdg/Trash", "trunc", (char *)0, (char *)0,
+          (Str){(u8 *)"Path=/x\xe2\x82", 9});
+    winfo("/xdg/Trash", "cont", (char *)0, (char *)0,
+          (Str){(u8 *)"Path=/x\xe2\x41y", 10});
+    setstdin("\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.err, "Non parsable trashinfo file: /xdg/Trash/info/bad.trashinfo, "
+                  "because 'utf-8' codec can't decode byte 0xff in position "
+                  "20: invalid start byte\n");
+    CK_HAS(r.err, "trunc.trashinfo, because 'utf-8' codec can't decode bytes "
+                  "in position 7-8: unexpected end of data\n");
+    CK_HAS(r.err, "cont.trashinfo, because 'utf-8' codec can't decode byte "
+                  "0xe2 in position 7: invalid continuation byte\n");
+}
+
+static void test_restore_listing_escapes_invalid_bytes(void)
+{
+    mktrash("/xdg/Trash");
+    winfo("/xdg/Trash", "e", "/work/a%FFb", "2001-01-01T00:00:00", (Str){});
+    wbackup("/xdg/Trash", "e", "x");
+    setstdin("\n");
+    Res r = trestore();
+    CK_HAS(r.out, " /work/a\\xffb\n");
+}
+
+static void test_restore_reports_unreadable_trashinfo_like_python(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "a", "/work/a", "2001-01-01T00:00:00");
+    vchmod("/xdg/Trash/info/a.trashinfo", 0);
+    setstdin("\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.err, "IOErrorReadingTrashInfo(path='/xdg/Trash/info/a.trashinfo',"
+                  " error=\"[Errno 13] Permission denied: "
+                  "'/xdg/Trash/info/a.trashinfo'\")\n");
+}
+
+static void test_restore_overwrite_across_devices(void)
+{
+    addmount("/vol", 2);
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "x", "/vol/x", "2001-01-01T00:00:00");
+    vwrite("/vol/x", "old");
+    setcwd("/vol");
+    setstdin("0\n");
+    Res r = trestore("--overwrite");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    ck_contents("/vol/x", "data");
+    ck_gone("/xdg/Trash/files/x");
+    ck_gone("/xdg/Trash/info/x.trashinfo");
+}
+
+// -- Review fixes: trash-empty and trash-rm -------------------------------------
+
+static void test_rm_star_pattern_matches_names_containing_a_star(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "s1", "/d/*!", (char *)0);
+    make_trashed("/xdg/Trash", "s2", "/d/*b", (char *)0);
+    make_trashed("/xdg/Trash", "s3", "/d/plain", (char *)0);
+    Res r = trm("*");
+    CK_EQ(r.exit, 0);
+    Str names[64];
+    CK_EQ(vlist("/xdg/Trash/info", names), 0);
+}
+
+static void test_rm_matches_characters_not_bytes(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "u1", "/d/\xc3\xa9", (char *)0);      // é
+    make_trashed("/xdg/Trash", "u2", "/d/\xc3\xbcn\xc3\xa9.txt", (char *)0);
+    make_trashed("/xdg/Trash", "u3", "/d/\xc3\xa9\xc3\xbcx", (char *)0);
+    make_trashed("/xdg/Trash", "u4", "/d/z", (char *)0);
+    CK_EQ(trm("?").exit, 0);                 // one character: é and z
+    ck_gone("/xdg/Trash/info/u1.trashinfo");
+    ck_gone("/xdg/Trash/info/u4.trashinfo");
+    ck_present("/xdg/Trash/info/u2.trashinfo");
+    CK_EQ(trm("\xc3\xbcn?.txt").exit, 0);    // ün?.txt
+    ck_gone("/xdg/Trash/info/u2.trashinfo");
+    CK_EQ(trm("??x").exit, 0);
+    ck_gone("/xdg/Trash/info/u3.trashinfo");
+    make_trashed("/xdg/Trash", "u5", "/d/\xc3\xa9", (char *)0);
+    CK_EQ(trm("[\xc3\xa0-\xc3\xbc]").exit, 0);   // [à-ü]
+    ck_gone("/xdg/Trash/info/u5.trashinfo");
+}
+
+static void test_rm_reports_removal_failures_and_exits_1(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "a", "/d/a", (char *)0);
+    vchmod("/xdg/Trash/info", 0555);
+    Res r = trm("a");
+    CK_EQ(r.exit, 1);
+    CK_S(r.err, S("trash-rm: cannot remove /xdg/Trash/info/a.trashinfo: "
+                  "[Errno 13] Permission denied\n"));
+    ck_gone("/xdg/Trash/files/a");
+    ck_present("/xdg/Trash/info/a.trashinfo");
+    // a backup that cannot be removed keeps its info file, and the next
+    // entries are still handled
+    vchmod("/xdg/Trash/info", 0755);
+    vchmod("/xdg/Trash/files", 0555);
+    make_trashed("/xdg/Trash", "b", "/d/b", (char *)0);
+    r = trm("[ab]");
+    CK_EQ(r.exit, 1);
+    CK_HAS(r.err, "trash-rm: cannot remove /xdg/Trash/files/b: [Errno 13]");
+    ck_present("/xdg/Trash/info/b.trashinfo");
+    ck_gone("/xdg/Trash/info/a.trashinfo");
+}
+
+static void test_empty_rm_and_list_skip_a_trash_dir_behind_an_unreadable_parent(void)
+{
+    vmkdir("/locked/x/Trash/info");
+    vwrite("/locked/x/Trash/info/a.trashinfo",
+           "[Trash Info]\nPath=/d/a\nDeletionDate=2001-01-01T00:00:00\n");
+    vchmod("/locked", 0);
+    envset("XDG_DATA_HOME", "/locked/x");
+    Res r = tempty("-f");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    r = trm("a");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+    r = tlist();
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S(""));
+}
+
+static void test_empty_warns_about_a_bad_trash_date_per_trashinfo(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "a", "/d/a", "2001-01-01T00:00:00");
+    make_trashed("/xdg/Trash", "b", "/d/b", (char *)0);       // no date
+    make_trashed("/xdg/Trash", "c", "/d/c", "garbage");       // bad date
+    envset("TRASH_DATE", "bogus");
+    Res r = tempty("-f", "30");
+    CK_EQ(r.exit, 0);
+    CK_S(r.err, S("trash-empty: invalid TRASH_DATE: bogus\n"
+                  "trash-empty: invalid TRASH_DATE: bogus\n"
+                  "trash-empty: invalid TRASH_DATE: bogus\n"));
+    // without days the clock is never read
+    r = tempty("-f");
+    CK_S(r.err, S(""));
+}
+
+static void test_empty_print_time_warns_about_a_bad_trash_date(void)
+{
+    envset("TRASH_DATE", "bogus");
+    Res r = tempty("--print-time");
+    CK_EQ(r.exit, 0);
+    CK_S(r.out, S("2026-06-01T12:00:00\n"));
+    CK_S(r.err, S("trash-empty: invalid TRASH_DATE: bogus\n"));
+}
+
+// -- Review fixes: shared parsing -------------------------------------------------
+
+static void test_deletion_dates_follow_strptime(void)
+{
+    mktrash("/trash");
+    struct { char *date, *want; } cases[] = {
+        {"2020-1-2T3:4:5",        "2020-01-02 03:04:05"},
+        {"2020-01- 2T03:04:05",   "2020-01-02 03:04:05"},
+        {"2020-01-02t03:04:05",   "2020-01-02 03:04:05"},
+        {"\xd9\xa2\xd9\xa0\xd9\xa2\xd9\xa0-01-02T03:04:05",
+                                  "2020-01-02 03:04:05"},   // Arabic-Indic
+        {"0000-01-02T03:04:05",   "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?"},
+        {"2020-01-02T03:04:60",   "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?"},
+        {"2020-02-30T03:04:05",   "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?"},
+        {"2020-01-02T03:04:05 ",  "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?"},
+        {"2020-01-02T03:04",      "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?"},
+        {"2020-01-02T24:00:00",   "\?\?\?\?-\?\?-\?\? \?\?:\?\?:\?\?"},
+    };
+    for (uz i = 0; i < countof(cases); i++) {
+        char *stem = vfmt("d%d", (int)i);
+        winfo("/trash", stem, vfmt("/work/%s", stem), cases[i].date, (Str){});
+        Res r = tlist("--trash-dir", "/trash");
+        CK_HAS_C(r.out, vfmt("%s /work/%s\n", cases[i].want, stem));
+    }
+}
+
+static void test_days_follows_python_int(void)
+{
+    mktrash("/xdg/Trash");
+    for (char **d = (char *[]){"1_0", " 5 ", "+5", "\xd9\xa5", "007", 0}; *d;
+         d++) {
+        make_trashed("/xdg/Trash", "o", "/work/o", "2000-01-01T00:00:00");
+        Res r = tempty("-f", *d);
+        CK_EQ(r.exit, 0);
+        ck_gone("/xdg/Trash/info/o.trashinfo");
+    }
+    CK_EQ(tempty("1__0").exit, 2);
+    CK_EQ(tempty("_1").exit, 2);
+    CK_EQ(tempty("1_").exit, 2);
+    CK_EQ(tempty("1.5").exit, 2);
+}
+
+static void test_trash_date_follows_strptime_and_is_not_trimmed(void)
+{
+    envset("TRASH_DATE", "2020-1-2T3:4:5");
+    Res r = tempty("--print-time");
+    CK_S(r.out, S("2020-01-02T03:04:05\n"));
+    CK_S(r.err, S(""));
+    envset("TRASH_DATE", " 2020-01-02T03:04:05");
+    r = tempty("--print-time");
+    CK_S(r.out, S("2026-06-01T12:00:00\n"));
+    CK_S(r.err, S("trash-empty: invalid TRASH_DATE:  2020-01-02T03:04:05\n"));
+    envset("TRASH_DATE", "0000-01-02T03:04:05");
+    r = tempty("--print-time");
+    CK_S(r.out, S("2026-06-01T12:00:00\n"));
+    CK_HAS(r.err, "invalid TRASH_DATE: 0000-01-02T03:04:05");
+}
+
+static void test_trashinfo_lines_end_at_any_newline_style(void)
+{
+    mktrash("/trash");
+    Str cr = S("[Trash Info]\rPath=/work/cr\rDeletionDate=2001-02-03T04:05:06\r");
+    Str crlf = S("[Trash Info]\r\nPath=/work/crlf\r\n"
+                 "DeletionDate=2001-02-03T04:05:06\r\n");
+    Str mid = S("[Trash Info]\nPath=/work/a\rb\nDeletionDate=2001-02-03T04:05:06\n");
+    winfo("/trash", "cr", (char *)0, (char *)0, cr);
+    winfo("/trash", "crlf", (char *)0, (char *)0, crlf);
+    winfo("/trash", "mid", (char *)0, (char *)0, mid);
+    Res r = tlist("--trash-dir", "/trash");
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.out, "2001-02-03 04:05:06 /work/cr\n");
+    CK_HAS(r.out, "2001-02-03 04:05:06 /work/crlf\n");
+    CK_HAS(r.out, "2001-02-03 04:05:06 /work/a\n");   // the \r ended the line
+}
+
+static void test_restore_refuses_a_path_with_an_embedded_nul(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "z", "/work/a%00b", "2001-02-03T04:05:06");
+    setstdin("0\n");
+    Res r = trestore();
+    CK_EQ(r.exit, 1);
+    CK_S(r.err, S("embedded null byte\n"));
+    ck_gone("/work/a");
+    ck_present("/xdg/Trash/files/z");
+    ck_present("/xdg/Trash/info/z.trashinfo");
+}
+
+// -- Review fixes: argparse fidelity -------------------------------------------
+
+// generated from Python 3.12.15 argparse running the upstream parsers
+typedef struct { char *persona; char *args[6]; i32 cols; i32 exit; char *out; char *err; } ApCase;
+
+static const ApCase apcases[] = {
+    {"trash-put", {"-h"}, 80, 0,
+        "usage: trash-put [OPTION]... FILE...\n"
+        "\n"
+        "Put files in trash\n"
+        "\n"
+        "positional arguments:\n"
+        "  files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  -d, --directory       ignored (for GNU rm compatibility)\n"
+        "  -f, --force           silently ignore nonexistent files\n"
+        "  -i, --interactive     prompt before every removal\n"
+        "  -r, -R, --recursive   ignored (for GNU rm compatibility)\n"
+        "  --trash-dir TRASHDIR  use TRASHDIR as trash folder\n"
+        "  -v, --verbose         explain what is being done\n"
+        "  --version             show program's version number and exit\n"
+        "\n"
+        "all trash-cli commands:\n"
+        "  trash-put             trash files and directories.\n"
+        "  trash-empty           empty the trashcan(s).\n"
+        "  trash-list            list trashed files.\n"
+        "  trash-restore         restore a trashed file.\n"
+        "  trash-rm              remove individual files from the trashcan\n"
+        "\n"
+        "To remove a file whose name starts with a '-', for example '-foo',\n"
+        "use one of these commands:\n"
+        "\n"
+        "    trash -- -foo\n"
+        "\n"
+        "    trash ./-foo\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-put", {"-h"}, 50, 0,
+        "usage: trash-put [OPTION]... FILE...\n"
+        "\n"
+        "Put files in trash\n"
+        "\n"
+        "positional arguments:\n"
+        "  files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message\n"
+        "                        and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion\n"
+        "                        script\n"
+        "  -d, --directory       ignored (for GNU rm\n"
+        "                        compatibility)\n"
+        "  -f, --force           silently ignore\n"
+        "                        nonexistent files\n"
+        "  -i, --interactive     prompt before every\n"
+        "                        removal\n"
+        "  -r, -R, --recursive   ignored (for GNU rm\n"
+        "                        compatibility)\n"
+        "  --trash-dir TRASHDIR  use TRASHDIR as trash\n"
+        "                        folder\n"
+        "  -v, --verbose         explain what is being\n"
+        "                        done\n"
+        "  --version             show program's version\n"
+        "                        number and exit\n"
+        "\n"
+        "all trash-cli commands:\n"
+        "  trash-put             trash files and directories.\n"
+        "  trash-empty           empty the trashcan(s).\n"
+        "  trash-list            list trashed files.\n"
+        "  trash-restore         restore a trashed file.\n"
+        "  trash-rm              remove individual files from the trashcan\n"
+        "\n"
+        "To remove a file whose name starts with a '-', for example '-foo',\n"
+        "use one of these commands:\n"
+        "\n"
+        "    trash -- -foo\n"
+        "\n"
+        "    trash ./-foo\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-put", {"-h"}, 120, 0,
+        "usage: trash-put [OPTION]... FILE...\n"
+        "\n"
+        "Put files in trash\n"
+        "\n"
+        "positional arguments:\n"
+        "  files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  -d, --directory       ignored (for GNU rm compatibility)\n"
+        "  -f, --force           silently ignore nonexistent files\n"
+        "  -i, --interactive     prompt before every removal\n"
+        "  -r, -R, --recursive   ignored (for GNU rm compatibility)\n"
+        "  --trash-dir TRASHDIR  use TRASHDIR as trash folder\n"
+        "  -v, --verbose         explain what is being done\n"
+        "  --version             show program's version number and exit\n"
+        "\n"
+        "all trash-cli commands:\n"
+        "  trash-put             trash files and directories.\n"
+        "  trash-empty           empty the trashcan(s).\n"
+        "  trash-list            list trashed files.\n"
+        "  trash-restore         restore a trashed file.\n"
+        "  trash-rm              remove individual files from the trashcan\n"
+        "\n"
+        "To remove a file whose name starts with a '-', for example '-foo',\n"
+        "use one of these commands:\n"
+        "\n"
+        "    trash -- -foo\n"
+        "\n"
+        "    trash ./-foo\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-list", {"-h"}, 80, 0,
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "\n"
+        "List trashed files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  --version             show program's version number and exit\n"
+        "  --volumes             list volumes\n"
+        "  --trash-dirs          list trash dirs\n"
+        "  --trash-dir TRASH_DIRS\n"
+        "                        specify the trash directory to use\n"
+        "  --all-users           list trashcans of all the users\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-list", {"-h"}, 50, 0,
+        "usage: trash-list [-h]\n"
+        "                  [--print-completion {bash,zsh,tcsh}]\n"
+        "                  [--version] [--volumes]\n"
+        "                  [--trash-dirs]\n"
+        "                  [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "\n"
+        "List trashed files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message\n"
+        "                        and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion\n"
+        "                        script\n"
+        "  --version             show program's version\n"
+        "                        number and exit\n"
+        "  --volumes             list volumes\n"
+        "  --trash-dirs          list trash dirs\n"
+        "  --trash-dir TRASH_DIRS\n"
+        "                        specify the trash\n"
+        "                        directory to use\n"
+        "  --all-users           list trashcans of all\n"
+        "                        the users\n"
+        "\n"
+        "Report bugs to\n"
+        "https://github.com/andreafrancia/trash-\n"
+        "cli/issues\n"
+        "",
+        ""},
+    {"trash-list", {"-h"}, 120, 0,
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version] [--volumes] [--trash-dirs]\n"
+        "                  [--trash-dir TRASH_DIRS] [--all-users]\n"
+        "\n"
+        "List trashed files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  --version             show program's version number and exit\n"
+        "  --volumes             list volumes\n"
+        "  --trash-dirs          list trash dirs\n"
+        "  --trash-dir TRASH_DIRS\n"
+        "                        specify the trash directory to use\n"
+        "  --all-users           list trashcans of all the users\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-restore", {"-h"}, 80, 0,
+        "usage: trash-restore [-h] [--print-completion {bash,zsh,tcsh}]\n"
+        "                     [--sort {date,path,none}] [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "\n"
+        "Restores from trash chosen file\n"
+        "\n"
+        "positional arguments:\n"
+        "  path                  Restore files from given path instead of current\n"
+        "                        directory (default: )\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script (default: None)\n"
+        "  --sort {date,path,none}\n"
+        "                        Sort list of restore candidates by given field\n"
+        "                        (default: date)\n"
+        "  --version\n"
+        "  --overwrite           Overwrite existing files with files coming out of the\n"
+        "                        trash (default: False)\n"
+        "",
+        ""},
+    {"trash-restore", {"-h"}, 50, 0,
+        "usage: trash-restore [-h]\n"
+        "                     [--print-completion {bash,zsh,tcsh}]\n"
+        "                     [--sort {date,path,none}]\n"
+        "                     [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "\n"
+        "Restores from trash chosen file\n"
+        "\n"
+        "positional arguments:\n"
+        "  path                  Restore files from given\n"
+        "                        path instead of current\n"
+        "                        directory (default: )\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message\n"
+        "                        and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion\n"
+        "                        script (default: None)\n"
+        "  --sort {date,path,none}\n"
+        "                        Sort list of restore\n"
+        "                        candidates by given\n"
+        "                        field (default: date)\n"
+        "  --version\n"
+        "  --overwrite           Overwrite existing files\n"
+        "                        with files coming out of\n"
+        "                        the trash (default:\n"
+        "                        False)\n"
+        "",
+        ""},
+    {"trash-restore", {"-h"}, 120, 0,
+        "usage: trash-restore [-h] [--print-completion {bash,zsh,tcsh}] [--sort {date,path,none}] [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "\n"
+        "Restores from trash chosen file\n"
+        "\n"
+        "positional arguments:\n"
+        "  path                  Restore files from given path instead of current directory (default: )\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script (default: None)\n"
+        "  --sort {date,path,none}\n"
+        "                        Sort list of restore candidates by given field (default: date)\n"
+        "  --version\n"
+        "  --overwrite           Overwrite existing files with files coming out of the trash (default: False)\n"
+        "",
+        ""},
+    {"trash-empty", {"-h"}, 80, 0,
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "\n"
+        "Purge trashed files.\n"
+        "\n"
+        "positional arguments:\n"
+        "  days\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  --version             show program's version number and exit\n"
+        "  -v, --verbose         list files that will be deleted\n"
+        "  --trash-dir TRASH_DIR\n"
+        "                        specify the trash directory to use\n"
+        "  --all-users           empty all trashcan of all the users\n"
+        "  -i, --interactive     ask before emptying trash directories\n"
+        "  -f                    don't ask before emptying trash directories\n"
+        "  --dry-run             show which files would have been removed\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-empty", {"-h"}, 50, 0,
+        "usage: trash-empty [-h]\n"
+        "                   [--print-completion {bash,zsh,tcsh}]\n"
+        "                   [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR]\n"
+        "                   [--all-users] [-i] [-f]\n"
+        "                   [--dry-run]\n"
+        "                   [days]\n"
+        "\n"
+        "Purge trashed files.\n"
+        "\n"
+        "positional arguments:\n"
+        "  days\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message\n"
+        "                        and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion\n"
+        "                        script\n"
+        "  --version             show program's version\n"
+        "                        number and exit\n"
+        "  -v, --verbose         list files that will be\n"
+        "                        deleted\n"
+        "  --trash-dir TRASH_DIR\n"
+        "                        specify the trash\n"
+        "                        directory to use\n"
+        "  --all-users           empty all trashcan of\n"
+        "                        all the users\n"
+        "  -i, --interactive     ask before emptying\n"
+        "                        trash directories\n"
+        "  -f                    don't ask before\n"
+        "                        emptying trash\n"
+        "                        directories\n"
+        "  --dry-run             show which files would\n"
+        "                        have been removed\n"
+        "\n"
+        "Report bugs to\n"
+        "https://github.com/andreafrancia/trash-\n"
+        "cli/issues\n"
+        "",
+        ""},
+    {"trash-empty", {"-h"}, 120, 0,
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v] [--trash-dir TRASH_DIR] [--all-users]\n"
+        "                   [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "\n"
+        "Purge trashed files.\n"
+        "\n"
+        "positional arguments:\n"
+        "  days\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  --version             show program's version number and exit\n"
+        "  -v, --verbose         list files that will be deleted\n"
+        "  --trash-dir TRASH_DIR\n"
+        "                        specify the trash directory to use\n"
+        "  --all-users           empty all trashcan of all the users\n"
+        "  -i, --interactive     ask before emptying trash directories\n"
+        "  -f                    don't ask before emptying trash directories\n"
+        "  --dry-run             show which files would have been removed\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+    {"trash-list", {"--v"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: ambiguous option: --v could match --version, --volumes\n"
+        ""},
+    {"trash-list", {"--trash-dir"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: argument --trash-dir: expected one argument\n"
+        ""},
+    {"trash-list", {"--trash-dir", "-v"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: argument --trash-dir: expected one argument\n"
+        ""},
+    {"trash-list", {"--print-completion", "foo"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: argument --print-completion: invalid choice: 'foo' (choose from bash, zsh, tcsh)\n"
+        ""},
+    {"trash-list", {"--volumes=1"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: argument --volumes: ignored explicit argument '1'\n"
+        ""},
+    {"trash-list", {"-5x"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: unrecognized arguments: -5x\n"
+        ""},
+    {"trash-list", {"x"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: unrecognized arguments: x\n"
+        ""},
+    {"trash-list", {"--version", "--bogus"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: unrecognized arguments: --bogus\n"
+        ""},
+    {"trash-list", {"--bogus", "--version"}, 80, 2,
+        "",
+        "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] [--version]\n"
+        "                  [--volumes] [--trash-dirs] [--trash-dir TRASH_DIRS]\n"
+        "                  [--all-users]\n"
+        "trash-list: error: unrecognized arguments: --bogus\n"
+        ""},
+    {"trash-restore", {"--sort", "foo"}, 80, 2,
+        "",
+        "usage: trash-restore [-h] [--print-completion {bash,zsh,tcsh}]\n"
+        "                     [--sort {date,path,none}] [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "trash-restore: error: argument --sort: invalid choice: 'foo' (choose from date, path, none)\n"
+        ""},
+    {"trash-restore", {"a", "b"}, 80, 2,
+        "",
+        "usage: trash-restore [-h] [--print-completion {bash,zsh,tcsh}]\n"
+        "                     [--sort {date,path,none}] [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "trash-restore: error: unrecognized arguments: b\n"
+        ""},
+    {"trash-restore", {"-vx"}, 80, 2,
+        "",
+        "usage: trash-restore [-h] [--print-completion {bash,zsh,tcsh}]\n"
+        "                     [--sort {date,path,none}] [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "trash-restore: error: unrecognized arguments: -vx\n"
+        ""},
+    {"trash-restore", {"--version", "x"}, 80, 0,
+        "trash-restore 0.26.9.29\n"
+        "",
+        ""},
+    {"trash-restore", {"--o=1"}, 80, 2,
+        "",
+        "usage: trash-restore [-h] [--print-completion {bash,zsh,tcsh}]\n"
+        "                     [--sort {date,path,none}] [--version] [--overwrite]\n"
+        "                     [path]\n"
+        "trash-restore: error: argument --overwrite: ignored explicit argument '1'\n"
+        ""},
+    {"trash-empty", {"x", "6"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument days: invalid int value: 'x'\n"
+        ""},
+    {"trash-empty", {"-v=x"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument -v/--verbose: ignored explicit argument 'x'\n"
+        ""},
+    {"trash-empty", {"--force"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: unrecognized arguments: --force\n"
+        ""},
+    {"trash-empty", {"--version", "abc"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument days: invalid int value: 'abc'\n"
+        ""},
+    {"trash-empty", {"abc", "--version"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument days: invalid int value: 'abc'\n"
+        ""},
+    {"trash-empty", {"abc", "-h"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument days: invalid int value: 'abc'\n"
+        ""},
+    {"trash-empty", {"-vx"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: unrecognized arguments: -x\n"
+        ""},
+    {"trash-empty", {"--ver"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: ambiguous option: --ver could match --version, --verbose\n"
+        ""},
+    {"trash-empty", {"1_0x"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument days: invalid int value: '1_0x'\n"
+        ""},
+    {"trash-empty", {"5", "--trash-dir"}, 80, 2,
+        "",
+        "usage: trash-empty [-h] [--print-completion {bash,zsh,tcsh}] [--version] [-v]\n"
+        "                   [--trash-dir TRASH_DIR] [--all-users] [-i] [-f] [--dry-run]\n"
+        "                   [days]\n"
+        "trash-empty: error: argument --trash-dir: expected one argument\n"
+        ""},
+    {"trash-put", {"--trash-dir", "-v", "f"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: argument --trash-dir: expected one argument\n"
+        ""},
+    {"trash-put", {"-f=x", "f"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: argument -f/--force: ignored explicit argument 'x'\n"
+        ""},
+    {"trash-put", {"--ver", "f"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: ambiguous option: --ver could match --verbose, --version\n"
+        ""},
+    {"trash-put", {"-x", "f"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: unrecognized arguments: -x\n"
+        ""},
+    {"trash-put", {"--print-completion", "fish"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: argument --print-completion: invalid choice: 'fish' (choose from bash, zsh, tcsh)\n"
+        ""},
+    {"trash-put", {"--force-volume", "-v", "f"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: argument --force-volume: expected one argument\n"
+        ""},
+    {"trash-put", {"--f", "f"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: ambiguous option: --f could match --force, --force-volume\n"
+        ""},
+    {"trash-put", {"-5x"}, 80, 2,
+        "",
+        "usage: trash-put [OPTION]... FILE...\n"
+        "trash-put: error: unrecognized arguments: -5x\n"
+        ""},
+    {"trash-put", {"--version"}, 80, 0,
+        "0.26.9.29\n"
+        "",
+        ""},
+    {"trash-put", {"-h", "x"}, 80, 0,
+        "usage: trash-put [OPTION]... FILE...\n"
+        "\n"
+        "Put files in trash\n"
+        "\n"
+        "positional arguments:\n"
+        "  files\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --print-completion {bash,zsh,tcsh}\n"
+        "                        print shell completion script\n"
+        "  -d, --directory       ignored (for GNU rm compatibility)\n"
+        "  -f, --force           silently ignore nonexistent files\n"
+        "  -i, --interactive     prompt before every removal\n"
+        "  -r, -R, --recursive   ignored (for GNU rm compatibility)\n"
+        "  --trash-dir TRASHDIR  use TRASHDIR as trash folder\n"
+        "  -v, --verbose         explain what is being done\n"
+        "  --version             show program's version number and exit\n"
+        "\n"
+        "all trash-cli commands:\n"
+        "  trash-put             trash files and directories.\n"
+        "  trash-empty           empty the trashcan(s).\n"
+        "  trash-list            list trashed files.\n"
+        "  trash-restore         restore a trashed file.\n"
+        "  trash-rm              remove individual files from the trashcan\n"
+        "\n"
+        "To remove a file whose name starts with a '-', for example '-foo',\n"
+        "use one of these commands:\n"
+        "\n"
+        "    trash -- -foo\n"
+        "\n"
+        "    trash ./-foo\n"
+        "\n"
+        "Report bugs to https://github.com/andreafrancia/trash-cli/issues\n"
+        "",
+        ""},
+};
+
+static void test_argparse_output_matches_python(void)
+{
+    for (uz i = 0; i < countof(apcases); i++) {
+        const ApCase *k = &apcases[i];
+        Str args[6];
+        iz  n = 0;
+        while (n < 6 && k->args[n]) {
+            args[n] = import((u8 *)k->args[n]);
+            n++;
+        }
+        envset("COLUMNS", vfmt("%d", k->cols));
+        Res r = vruna(import((u8 *)k->persona), n, args);
+        Str want_out = import((u8 *)k->out), want_err = import((u8 *)k->err);
+        if (r.exit != k->exit || !equals(r.out, want_out)
+            || !equals(r.err, want_err)) {
+            char g[1024], w[1024];
+            vrepr(g, sizeof g, r.err);
+            vrepr(w, sizeof w, want_err);
+            vfail(__FILE__, __LINE__, "%s %s ... (columns %d): exit %d want "
+                  "%d, out %s, stderr got %s, want %s", k->persona,
+                  k->args[0], k->cols, r.exit, k->exit,
+                  equals(r.out, want_out) ? "ok" : "differs", g, w);
+        }
+    }
+}
+
+static void test_argparse_option_value_cannot_look_like_an_option(void)
+{
+    Res r = tput("--trash-dir", "-v", "f");
+    CK_EQ(r.exit, 2);
+    CK_HAS(r.err, "trash-put: error: argument --trash-dir: expected one "
+                  "argument\n");
+    r = tput("--trash-dir=-v", "nonexistent");   // an explicit value is fine
+    CK_EQ(r.exit, 74);
+    r = tput("--force-volume", "--", "f");
+    CK_EQ(r.exit, 2);
+    r = tlist("--trash-dir", "--all-users");
+    CK_EQ(r.exit, 2);
+}
+
+static void test_argparse_clusters_and_explicit_arguments(void)
+{
+    Res r = tput("-fv", "nonexistent");   // two flags in one token
+    CK_EQ(r.exit, 0);
+    r = tput("-vx", "f");                 // the unknown piece is reported alone
+    CK_EQ(r.exit, 2);
+    CK_HAS(r.err, "unrecognized arguments: -x\n");
+    r = tput("-v=1", "f");
+    CK_EQ(r.exit, 2);
+    CK_HAS(r.err, "argument -v/--verbose: ignored explicit argument '1'\n");
+    r = tput("--verbose=1", "f");
+    CK_HAS(r.err, "argument -v/--verbose: ignored explicit argument '1'\n");
+    r = tempty("--v=1");
+    CK_HAS(r.err, "ambiguous option: --v=1 could match --version, --verbose\n");
+    r = tput("--ver", "f");
+    CK_HAS(r.err, "ambiguous option: --ver could match --verbose, --version\n");
+}
+
+static void test_argparse_negative_numbers_and_separator(void)
+{
+    mktrash("/xdg/Trash");
+    make_trashed("/xdg/Trash", "a", "/work/-5", "2001-01-01T00:00:00");
+    setstdin("\n");
+    Res r = trestore("-5");   // a negative number is an argument, not an option
+    CK_EQ(r.exit, 0);
+    CK_HAS(r.out, " /work/-5\n");
+    setstdin("\n");
+    r = trestore("--", "-5");
+    CK_HAS(r.out, " /work/-5\n");
+    r = tempty("-f", "-5");   // days = -5: nothing older than five days ahead
+    CK_EQ(r.exit, 0);
+    r = tput("-fv", "--", "-x", "nonexistent");
+    CK_EQ(r.exit, 0);
+}
+
+static void test_argparse_errors_come_in_argparse_order(void)
+{
+    // the first positional is converted before the extras are reported
+    Res r = tempty("x", "6");
+    CK_HAS(r.err, "argument days: invalid int value: 'x'\n");
+    // an exiting option wins over what comes after it, not over earlier errors
+    r = tput("--bogus", "--version");     // put's --version is an action
+    CK_EQ(r.exit, 0);
+    CK_S(r.out, S("0.26.9.29\n"));
+    r = tlist("--version", "--bogus");    // list's is a plain flag: parse on
+    CK_EQ(r.exit, 2);
+    r = tempty("--version", "--bogus");
+    CK_EQ(r.exit, 2);
+    r = tempty("abc", "-h");   // the positional is converted before -h acts
+    CK_EQ(r.exit, 2);
+    r = tempty("-h", "abc");
+    CK_EQ(r.exit, 0);
+}
+
+static void test_argparse_width_follows_columns_then_the_terminal(void)
+{
+    envdel("COLUMNS");
+    Res r = tlist("-h");                   // 80 columns by default
+    CK_HAS(r.out, "usage: trash-list [-h] [--print-completion {bash,zsh,tcsh}] "
+                  "[--version]\n");
+    v->istty[1]  = 1;
+    v->termcols  = 50;
+    r = tlist("-h");
+    CK_HAS(r.out, "usage: trash-list [-h]\n"
+                  "                  [--print-completion {bash,zsh,tcsh}]\n");
+    envset("COLUMNS", "100");              // $COLUMNS beats the terminal
+    r = tlist("-h");
+    CK_HAS(r.out, "[--volumes] [--trash-dirs]");
+    envset("COLUMNS", "0");                // not positive: the terminal again
+    r = tlist("-h");
+    CK_HAS(r.out, "usage: trash-list [-h]\n");
+    envset("COLUMNS", "x");                // not a number: the terminal
+    r = tlist("-h");
+    CK_HAS(r.out, "usage: trash-list [-h]\n");
+}
+
 // -- Checks the real kernel could not arrange hermetically (spec 11) -----------
 
 static void test_restore_volume_relative_path(void)
@@ -7760,8 +10854,9 @@ static void test_restore_volume_relative_path(void)
     setstdin("\n");
     Res r = trestore();
     CK_EQ(r.exit, 0);
-    CK_HAS(r.err, "Path= must be relative for volume trashes: "
-                  "/vol/.Trash-1000/info/abs.trashinfo");
+    CK_HAS(r.err, "Non parsable trashinfo file: "
+                  "/vol/.Trash-1000/info/abs.trashinfo, because Path= must "
+                  "be relative for volume trashes");
     Str lines[32];
     iz n = vlines(r.out, lines);
     CK_EQ(n, 2);   // one listing line plus the prompt

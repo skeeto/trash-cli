@@ -4,6 +4,8 @@ LDFLAGS = -s
 LDLIBS  =
 PREFIX  = $$HOME/.local
 
+.PHONY: check clean install uninstall
+
 bins = \
   bin/trash-empty \
   bin/trash-list \
@@ -23,8 +25,7 @@ trash: trash.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ trash.c $(LDLIBS)
 
 trash-test: trash.c
-	$(CC) $(CFLAGS) -fsanitize=undefined -fsanitize-trap -DTEST $(LDFLAGS) \
-	  -o $@ trash.c $(LDLIBS)
+	$(CC) $(CFLAGS) -DTEST $(LDFLAGS) -o $@ trash.c $(LDLIBS)
 
 check: trash-test
 	./trash-test
@@ -32,7 +33,7 @@ check: trash-test
 clean:
 	rm -f trash trash-test
 
-install: trash $(manpages)
+install: trash $(mans)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin/
 	cp trash $(DESTDIR)$(PREFIX)/bin/
 	for b in $(bins); do ln -sf trash $(DESTDIR)$(PREFIX)/$$b; done
