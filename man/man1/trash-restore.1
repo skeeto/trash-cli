@@ -1,0 +1,201 @@
+.\" trash-restore(1) manual page for trash-cli.
+.TH TRASH-RESTORE 1 2026-11-14 "trash-cli 0.26.9.29" "User Commands"
+.SH NAME
+trash\-restore \- restore a trashed file
+.SH SYNOPSIS
+.B trash\-restore
+[\fIOPTION\fR]...
+[\fIpath\fR]
+.SH DESCRIPTION
+.B trash\-restore
+lists the trashed files whose original location was
+.I path
+or lay under it, and asks which of them to restore.
+Without a
+.I path
+argument the current directory is used; a relative
+.I path
+is resolved against the current directory.
+A trashed file is a candidate when its original location equals
+.I path
+or lies under it;
+a
+.I path
+of
+\fB/\fR
+matches everything, so a directory argument lists everything trashed from
+its whole subtree.
+.PP
+The candidates are listed, one line per entry with the index right\-aligned
+in four columns and the raw deletion date
+(\fBNone\fR
+when the trashinfo file has no valid date), followed by the prompt
+\fBWhat file to restore [0..N]: \fR
+(the index range runs from 0 to the number of candidates minus 1, and the
+prompt line ends with a space):
+.RS
+.PP
+.nf
+   0 2026\-11\-13 19:51:08 /home/user/work/rf1
+   1 2026\-11\-13 19:51:08 /home/user/work/rf2
+What file to restore [0..1]:\ 
+.fi
+.RE
+.PP
+The reply is a comma\-separated list of indices or inclusive ranges:
+\fB0\-2, 3\fR
+restores indices 0, 1, 2 and 3; spaces around the commas are tolerated.
+An empty line restores nothing:
+\fBNo files were restored\fR
+is printed and the exit status is 0.
+An invalid reply is reported once on standard error and the exit status is
+1:
+.RS
+.PP
+.nf
+Invalid entry: not an index: <text>
+Invalid entry: open interval: <text>
+Invalid entry: out of range 0..N\-1: <index>
+.fi
+.RE
+An end of file at the prompt prints a bare newline on standard
+error and exits 1.
+.PP
+Restoring refuses to overwrite an existing file unless
+\fB\-\-overwrite\fR
+is given; an existing directory is never overwritten.
+The refusal message is
+\fBRefusing to overwrite existing file \(dq<basename>\(dq.\fR
+and the entry stays in the trash.
+Missing parent directories of the destination are created.
+The backup copy is moved back and its
+.I .trashinfo
+file is removed afterwards.
+Several indices may be given; a failure does not abort the batch, but any
+failure makes the exit status 1.
+.PP
+When there are no candidates,
+\fBNo files trashed from current dir (\(aq<realpath of cwd>\(aq)\fR
+is printed when no
+.I path
+argument was given, and
+\fBNo files trashed from \(aq<path>\(aq\fR
+when one was; the exit status is 0.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.B \-\-print\-completion {\fIbash\fR,\fIzsh\fR,\fItcsh\fR}
+Print a completion script for the named shell and exit.
+.TP
+.B \-\-version
+Print the program name and version, for example
+\fBtrash\-restore 0.26.9.29\fR,
+and exit.
+.TP
+.B \-\-sort {\fIdate\fR,\fIpath\fR,\fInone\fR}
+Order of the candidate list; the default is
+\fIdate\fR.
+\fIdate\fR:
+ascending by deletion date, entries without a valid date last.
+\fIpath\fR:
+ascending by original location, then by date, undated entries last.
+\fInone\fR:
+keep the trash scan order.
+.TP
+.B \-\-overwrite
+Allow replacing an existing file at the destination; an existing directory
+is still never overwritten.
+.TP
+.B \-\-trash\-dir \fIDIR\fR
+Search only
+.IR DIR ,
+used as\-is and without trust checks.
+This option is intentionally absent from
+\fB\-\-help\fR
+but documented here.
+.SH TRASH DIRECTORIES
+The trash cans searched are the home trash,
+\fI$XDG_DATA_HOME/Trash\fR
+when
+.B XDG_DATA_HOME
+is set and non\-empty and
+\fI$HOME/.local/share/Trash\fR
+otherwise, followed by, for every volume
+\fI$volume\fR,
+\fI$volume\fB/.Trash/\fI$uid\fR
+and
+\fI$volume\fB/.Trash\-\fI$uid\fR.
+\fBTRASH_VOLUMES\fR
+is honored, as in
+.BR trash\-list (1).
+.PP
+\fI$volume\fB/.Trash/\fI$uid\fR
+is searched only if
+\fB$volume\fB/.Trash\fR
+exists, is a directory with the sticky bit, and is not a symlink.
+In addition, a searched can is skipped, with a warning on standard error,
+when its
+.IR info/ " or " files/
+subdirectory is a symbolic link or world writable:
+\fBTrashDir skipped because its info dir is a symbolic link: \fI<path>\fR
+or
+\fBTrashDir skipped because its files dir is world writable: \fI<path>\fR.
+An unparsable trashinfo file, one that is not valid UTF\-8 included, is
+reported on standard error and skipped.
+.SH EXIT STATUS
+.TP
+.B 0
+Files restored, an empty reply, or no candidates.
+.TP
+.B 1
+An invalid reply, an overwrite refusal, a restore failure, or an end of
+file at the prompt.
+.TP
+.B 2
+Usage error.
+.SH ENVIRONMENT
+.TP
+.B XDG_DATA_HOME
+Location of the home trash,
+\fI$XDG_DATA_HOME/Trash\fR.
+Used only when set and non\-empty; an empty value is treated as unset, per
+the XDG basedir specification, so the home trash falls back to
+\fI$HOME/.local/share/Trash\fR.
+A relative value is used verbatim, resolved against the current directory.
+.TP
+.B HOME
+Fallback location of the home trash,
+\fI$HOME/.local/share/Trash\fR.
+.TP
+.B TRASH_VOLUMES
+Colon\-separated volume list overriding the mount table; empty items are
+dropped.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/Trash
+The home trash, when
+.B XDG_DATA_HOME
+is set and non\-empty.
+.TP
+.I $HOME/.local/share/Trash
+The home trash otherwise.
+.SH EXAMPLES
+.RS
+.PP
+.nf
+trash\-restore
+trash\-restore /home/user/work
+trash\-restore \-\-sort none \-\-overwrite
+.fi
+.RE
+.SH SEE ALSO
+.BR trash\-put (1),
+.BR trash (1),
+.BR trash\-list (1),
+.BR trash\-empty (1),
+.BR trash\-rm (1).
+.PP
+Implements the FreeDesktop.org Trash Specification,
+https://specifications.freedesktop.org/trash\-spec/

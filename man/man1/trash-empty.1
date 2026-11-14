@@ -1,0 +1,218 @@
+.\" trash-empty(1) manual page for trash-cli.
+.TH TRASH-EMPTY 1 2026-11-14 "trash-cli 0.26.9.29" "User Commands"
+.SH NAME
+trash\-empty \- empty the trash can(s)
+.SH SYNOPSIS
+.B trash\-empty
+[\fB\-h\fR]
+[\fB\-\-print\-completion {\fIbash\fB,\fIzsh\fB,\fItcsh\fB}\fR]
+[\fB\-\-version\fR]
+[\fB\-v\fR]
+[\fB\-\-trash\-dir \fITRASH_DIR\fR]
+[\fB\-\-all\-users\fR]
+[\fB\-i\fR]
+[\fB\-f\fR]
+[\fB\-\-dry\-run\fR]
+[\fIdays\fR]
+.SH DESCRIPTION
+.B trash\-empty
+permanently removes entries from the trash cans; there is no undo.
+Without a
+.I days
+argument everything is removed.
+With it, only files trashed strictly before
+\fInow \- days\fR
+(local time) are removed: a file trashed exactly at the cutoff is kept, and
+files with a missing or invalid
+.B DeletionDate
+are kept.
+A negative
+.I days
+moves the cutoff into the future and so removes everything.
+.PP
+Per trash can, the backup copies of the matching entries are removed first,
+then their info files; afterwards every orphan, an entry of
+.I files/
+without a matching info file, is removed regardless of
+.IR days .
+Entries of
+.I info/
+that do not end in
+\fB.trashinfo\fR
+are never touched.
+An unparsable trashinfo file, one that is not valid UTF\-8 included, is
+reported on standard error and skipped.
+Removal uses
+.BR unlink (2),
+falling back to a recursive removal for directories.
+A path that cannot be removed is reported as
+\fBtrash\-empty: cannot remove \fI<path>\fR
+and the run continues; the exit status stays 0.
+.PP
+\fB\-i\fR
+asks once, covering all trash cans together; the prompt line ends with a
+space:
+.RS
+.PP
+.nf
+Would empty the following trash directories:
+    \- <trash\-dir\-1>
+    \- <trash\-dir\-2>
+Proceed? (y/N)\ 
+.fi
+.RE
+.PP
+An answer whose first character is
+\fBy\fR
+or
+\fBY\fR
+proceeds; anything else aborts with no deletions and exit status 0.
+\fB\-f\fR
+never asks; by default the program asks only when standard input is a
+terminal.
+An end of file at the prompt is reported on standard error and the exit
+status is 1.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.B \-\-print\-completion {\fIbash\fR,\fIzsh\fR,\fItcsh\fR}
+Parse the option and exit 0; this implementation prints
+Please install shtab firstly! (upstream required the optional shtab
+module to emit a script).
+.TP
+.B \-\-version
+Print the program name and version, for example
+\fBtrash\-empty 0.26.9.29\fR,
+and exit.
+.TP
+.BR \-v ", " \-\-verbose
+Print
+\fBremoving \fI<path>\fR
+before each removal.
+.TP
+.B \-\-trash\-dir \fIDIR\fR
+Empty only the given trash can; the option is repeatable.
+It replaces discovery completely.
+.TP
+.B \-\-all\-users
+Empty every account's trash cans;
+\fB\-\-trash\-dir\fR
+is ignored.
+.TP
+.B \-i
+Ask before emptying (see DESCRIPTION).
+.TP
+.B \-f
+Never ask.
+When both
+\fB\-i\fR
+and
+\fB\-f\fR
+are given, the last one wins.
+.TP
+.B \-\-dry\-run
+Print
+\fBwould remove \fI<path>\fR
+instead of deleting; does not suppress the prompt.
+.TP
+.B \-\-print\-time
+Print the current, possibly faked, clock as
+\fBYYYY\-MM\-DDTHH:MM:SS\fR
+and exit.
+Undocumented upstream; mainly for testing and debugging.
+.SH ARGUMENTS
+.TP
+.I days
+Remove only files trashed strictly before
+\fInow \- days\fR.
+The value must be an integer; a value that is not an integer, and a value
+whose cutoff date falls outside the representable date range (years 1..9999),
+are usage errors with exit status 2.
+.SH TRASH DIRECTORIES
+The trash cans processed are the home trash,
+\fI$XDG_DATA_HOME/Trash\fR
+when
+.B XDG_DATA_HOME
+is set and non\-empty and
+\fI$HOME/.local/share/Trash\fR
+otherwise, followed by, for every volume
+\fI$volume\fR,
+\fI$volume\fB/.Trash/\fI$uid\fR
+(trust\-checked as in
+.BR trash\-list (1))
+and
+\fI$volume\fB/.Trash\-\fI$uid\fR.
+\fBTRASH_VOLUMES\fR
+is honored, as in
+.BR trash\-list (1).
+Nonexistent cans contribute nothing.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including a declined prompt and unremovable leftovers.
+.TP
+.B 2
+Usage error: a bad option, a
+.I days
+value that is not an integer or whose cutoff leaves the representable date
+range.
+.TP
+.B 1
+An end of file at the confirmation prompt.
+.SH ENVIRONMENT
+.TP
+.B XDG_DATA_HOME
+Location of the home trash,
+\fI$XDG_DATA_HOME/Trash\fR.
+Used only when set and non\-empty; an empty value is treated as unset, per
+the XDG basedir specification, so the home trash falls back to
+\fI$HOME/.local/share/Trash\fR.
+A relative value is used verbatim, resolved against the current directory.
+.TP
+.B HOME
+Fallback location of the home trash,
+\fI$HOME/.local/share/Trash\fR.
+.TP
+.B TRASH_VOLUMES
+Colon\-separated volume list overriding the mount table; empty items are
+dropped.
+.TP
+.B TRASH_DATE
+Fake the clock for the
+.I days
+comparison and for
+\fB\-\-print\-time\fR,
+as
+\fBYYYY\-MM\-DDTHH:MM:SS\fR.
+An invalid value is warned about
+(\fBtrash\-empty: invalid TRASH_DATE: \fI<value>\fR
+on standard error) and the real clock is used.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/Trash
+The home trash, when
+.B XDG_DATA_HOME
+is set and non\-empty.
+.TP
+.I $HOME/.local/share/Trash
+The home trash otherwise.
+.SH EXAMPLES
+.RS
+.PP
+.nf
+trash\-empty \-\-dry\-run \-v
+trash\-empty 30
+trash\-empty \-\-trash\-dir /mnt/usb/.Trash\-1000 \-f
+.fi
+.RE
+.SH SEE ALSO
+.BR trash\-put (1),
+.BR trash (1),
+.BR trash\-list (1),
+.BR trash\-restore (1),
+.BR trash\-rm (1).
+.PP
+Implements the FreeDesktop.org Trash Specification,
+https://specifications.freedesktop.org/trash\-spec/

@@ -1,0 +1,342 @@
+.\" trash-put(1) manual page for trash-cli.
+.TH TRASH-PUT 1 2026-11-14 "trash-cli 0.26.9.29" "User Commands"
+.SH NAME
+trash\-put \- trash files and directories
+.SH SYNOPSIS
+.B trash\-put
+[\fIOPTION\fR]...
+.IR FILE ...
+.SH DESCRIPTION
+.B trash\-put
+moves files and directories into the trash can defined by the FreeDesktop.org
+Trash Specification, recording the original location and the deletion time of
+each entry so that it can be listed with
+.BR trash\-list (1),
+restored with
+.BR trash\-restore (1),
+removed selectively with
+.BR trash\-rm (1),
+or purged with
+.BR trash\-empty (1).
+.PP
+All six trash\-cli commands are one program that dispatches on the name it is
+invoked as;
+\fBtrash\fR
+is an alias of
+\fBtrash\-put\fR,
+and every diagnostic uses the invoked name.
+.PP
+Trashable entries:
+.RS
+.IP \(bu 2
+regular files, empty or not;
+.IP \(bu 2
+directories, whole and recursively, read\-only directories included: only the
+parent directory needs write and search permission;
+.IP \(bu 2
+symbolic links: the link itself is trashed, never its target, dangling links
+included;
+.IP \(bu 2
+FIFOs, sockets and device nodes.
+.RE
+.PP
+The entry is moved with rename(2), so its permissions, timestamps and
+ownership survive the round trip.
+.PP
+A request is refused when the basename of the argument is exactly
+\fB.\fR
+or
+\fB..\fR,
+when the path does not exist (unless
+\fB\-f\fR
+is in effect), when the parent directory does not allow deleting the entry,
+or when the argument names an existing file but looks like an option (see the
+ARGUMENTS section).
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.B \-\-print\-completion \fIbash\fR|\fIzsh\fR|\fItcsh\fR
+Parse the option and exit 0; this implementation prints
+Please install shtab firstly! (upstream required the optional shtab
+module to emit a script).
+.TP
+.BR \-d ", " \-\-directory
+Accepted for GNU rm compatibility and ignored: directories are always
+trashed whole.
+.TP
+.BR \-f ", " \-\-force
+Silently ignore nonexistent files.
+When both
+\fB\-f\fR
+and
+\fB\-i\fR
+are given, the last one wins.
+.TP
+.BR \-i ", " \-\-interactive
+Prompt, on standard output, before trashing each file; the prompt line ends
+with a space:
+.RS
+.PP
+.nf
+trash\-put: trash <description> \(aq<path>\(aq?\ 
+.fi
+.RE
+.IP
+An answer whose first character is
+\fBy\fR
+or
+\fBY\fR
+confirms; anything else declines and leaves the file alone, which is not an
+error.
+<description>
+is one of: regular file, regular empty file, directory, symbolic link, entry
+(FIFO, socket or device node).
+An end of file at the prompt is reported on standard error and the exit
+status is 1.
+.TP
+.BR \-r ", " \-R ", " \-\-recursive
+Accepted for GNU rm compatibility and ignored: directories are always
+trashed recursively.
+.TP
+.B \-\-trash\-dir \fIDIR\fR
+Use
+.I DIR
+as the trash can instead of the automatic choice (see TRASH DIRECTORIES
+below).
+.I DIR
+is created if missing, with its
+.IR files/ " and " info/
+subdirectories in mode 0700.
+The file to trash must be on the same volume as
+.IR DIR ,
+otherwise the attempt fails.
+The value may also be attached,
+.BI \-\-trash\-dir= DIR .
+.TP
+.BR \-v ", " \-\-verbose
+Report successes:
+.RS
+.PP
+.nf
+trash\-put: \(aq<path>\(aq trashed in <trash\-dir>
+.fi
+.RE
+.IP
+Repeat the option for more detail:
+\fB\-vv\fR
+also reports every trash directory as it is tried.
+A leading
+.I $HOME
+in the trash directory is shortened to
+\fB\(ti/\fR
+in this message; set
+.B TRASH_PUT_DISABLE_SHRINK
+(=1) to disable the shortening.
+.TP
+.B \-\-version
+Print the bare version number and exit.
+.TP
+.B \-\-force\-volume \fIVOLUME\fR
+Pretend the file lives on
+.IR VOLUME ,
+skipping volume detection.
+Mainly for testing and debugging.
+.TP
+.B \-\-home\-fallback
+Add the home trash as a last\-resort candidate for files on other volumes.
+Effective only when
+.B TRASH_ENABLE_HOME_FALLBACK
+is
+.BR 1 .
+Mainly for testing and debugging.
+.SH ARGUMENTS
+The files and directories to trash.
+Trailing slashes are stripped from arguments
+(\fIdir\fR/
+trashes
+\fIdir\fR);
+a lone
+\fB/\fR
+survives.
+Options may precede or follow the file list, but an option placed between
+file arguments makes the trailing files unrecognized, which is a usage error
+(exit status 2).
+\fB\-\-\fR
+ends option processing: later arguments are always treated as files.
+An argument that starts with
+\fB\-\fR
+(a lone
+\fB\-\fR
+is exempt) and names an existing file is refused before anything is trashed:
+.RS
+.PP
+.nf
+trash\-put: error: refusing to treat existing file \-\-foo as an option (use \(aq./\-\-foo\(aq or a \(aq\-\-\(aq separator)
+.fi
+.RE
+.PP
+With no arguments at all:
+.RS
+.PP
+.nf
+usage: trash\-put [OPTION]... FILE...
+trash\-put: error: Please specify the files to trash.
+.fi
+.RE
+the exit status is 2;
+\fB\-f\fR
+does not bypass this.
+.SH TRASH DIRECTORIES
+A trash can is a directory with two subdirectories:
+\fI<trash\-dir>/info/\fR
+holding one
+\fI<name>.trashinfo\fR
+metadata file per trashed entry, and
+\fI<trash\-dir>/files/\fR
+holding the trashed content under the same stem.
+When
+.B trash\-put
+creates the can,
+.IR files/ " and " info/
+are made with mode 0700.
+.PP
+Each
+.I .trashinfo
+file is created with mode 0600, before the entry is moved, and contains
+exactly:
+.RS
+.PP
+.nf
+[Trash Info]
+Path=<percent\-encoded original location>
+DeletionDate=<YYYY\-MM\-DDTHH:MM:SS local time>
+.fi
+.RE
+.PP
+The original location is percent\-encoded per raw byte:
+\fBA\-Z a\-z 0\-9 _ . \- \(ti /\fR
+are kept literal, every other byte becomes
+\fB%NN\fR;
+a space becomes
+\fB%20\fR,
+a byte that is not valid UTF\-8 becomes
+\fB%FF\fR,
+and the round trip is byte\-exact.
+Home\-trash entries store absolute paths; volume trash entries store paths
+relative to their volume.
+Name collisions in
+.I files/
+get the suffixes
+\fB_1\fR
+through
+\fB_99\fR
+and then a random suffix.
+If the move into
+.I files/
+fails, the pair just written (backup copy and info file) is rolled back.
+.PP
+Without
+.BR \-\-trash\-dir ,
+the trash can for a file is picked from the following, in order, the first
+that works:
+.IP 1. 3
+the home trash, when the file is on the same volume as the home trash;
+.IP 2. 3
+\fI$volume\fB/.Trash/\fI$uid\fR, which requires
+\fB$volume\fB/.Trash\fR
+to be an existing, non\-symlink, sticky directory;
+.IP 3. 3
+\fI$volume\fB/.Trash\-\fI$uid\fR.
+.PP
+With
+\fB\-vv\fR
+each attempt is reported on standard error.
+.SH EXIT STATUS
+.TP
+.B 0
+Every argument was trashed, declined under
+\fB\-i\fR,
+or ignored under
+\fB\-f\fR.
+.TP
+.B 2
+Usage error: no file arguments, unknown option, an option between file
+arguments, or an existing file that looks like an option.
+.TP
+.B 74
+At least one file could not be trashed.
+.TP
+.B 1
+Fatal error, for example an end of file at an interactive prompt.
+.SH ENVIRONMENT
+.TP
+.B XDG_DATA_HOME
+Location of the home trash,
+\fI$XDG_DATA_HOME/Trash\fR.
+Used only when set and non\-empty; an empty value is treated as unset, per
+the XDG basedir specification, so the home trash falls back to
+\fI$HOME/.local/share/Trash\fR.
+A relative value is used verbatim, resolved against the current directory.
+.TP
+.B HOME
+Fallback location of the home trash,
+\fI$HOME/.local/share/Trash\fR;
+also the prefix shortened to
+\fB\(ti/\fR
+in
+\fB\-v\fR
+messages.
+.TP
+.B TRASH_ENABLE_HOME_FALLBACK
+Must be
+\fB1\fR
+to make
+\fB\-\-home\-fallback\fR
+effective.
+.TP
+.B TRASH_PUT_DISABLE_SHRINK
+When set to
+.BR 1 , no
+\fB\(ti/\fR
+shortening is applied in
+\fB\-v\fR
+messages.
+.TP
+.B TRASH_PUT_FAKE_UID_FOR_TESTING
+Integer overriding
+.BR getuid (2)
+when choosing
+\fI$volume\fB/.Trash/\fI$uid\fR
+and
+\fI$volume\fB/.Trash\-\fI$uid\fR;
+for testing.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/Trash
+The home trash, when
+.B XDG_DATA_HOME
+is set and non\-empty.
+.TP
+.I $HOME/.local/share/Trash
+The home trash otherwise.
+.SH EXAMPLES
+.RS
+.PP
+.nf
+trash\-put notes.txt
+trash\-put \-\- \-dashfile
+trash\-put \-\-trash\-dir=/tmp/trash \-v project/
+.fi
+.RE
+.SH SEE ALSO
+.BR trash (1),
+.BR trash\-list (1),
+.BR trash\-restore (1),
+.BR trash\-empty (1),
+.BR trash\-rm (1),
+.BR rename (2).
+.PP
+Implements the FreeDesktop.org Trash Specification,
+https://specifications.freedesktop.org/trash\-spec/

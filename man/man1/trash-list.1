@@ -1,0 +1,195 @@
+.\" trash-list(1) manual page for trash-cli.
+.TH TRASH-LIST 1 2026-11-14 "trash-cli 0.26.9.29" "User Commands"
+.SH NAME
+trash\-list \- list trashed files
+.SH SYNOPSIS
+.B trash\-list
+[\fB\-h\fR]
+[\fB\-\-print\-completion {\fIbash\fB,\fIzsh\fB,\fItcsh\fB}\fR]
+[\fB\-\-version\fR]
+[\fB\-\-volumes\fR]
+[\fB\-\-trash\-dirs\fR]
+[\fB\-\-trash\-dir \fITRASH_DIRS\fR]
+[\fB\-\-all\-users\fR]
+.SH DESCRIPTION
+.B trash\-list
+prints one line per trashed file:
+.RS
+.PP
+.nf
+<YYYY\-MM\-DD HH:MM:SS> <original location>
+.fi
+.RE
+.PP
+The date is the
+.B DeletionDate
+of the trashinfo file, local time; a missing or invalid date renders as the
+literal
+\fB????\-??\-?? ??:??:??\fR.
+The original location is reconstructed from the
+.B Path=
+field of the trashinfo file.
+Entries are collected from every
+\fI<trash\-dir>/info/*.trashinfo\fR
+of every trash can scanned, trash cans in scan order (home trash first, then
+volumes) and entries in directory order: there is no sorting and no
+deduplication.
+Orphans, entries in
+.I files/
+without an info file, are never listed.
+.PP
+When standard output is a terminal, paths are shell\-quoted GNU\-ls\-style so
+that they cannot inject terminal escapes, unless
+.B TRASH_RAW_OUTPUT
+is set.
+Output through a pipe is raw, with bytes that are not valid UTF\-8 rendered
+as
+\fB\\xNN\fR.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.B \-\-print\-completion {\fIbash\fR,\fIzsh\fR,\fItcsh\fR}
+Parse the option and exit 0; this implementation prints
+Please install shtab firstly! (upstream required the optional shtab
+module to emit a script).
+.TP
+.B \-\-version
+Print the program name and version, for example
+\fBtrash\-list 0.26.9.29\fR,
+and exit.
+.TP
+.B \-\-volumes
+Print the volume list, one path per line, and exit.
+.TP
+.B \-\-trash\-dirs
+Print the trash cans that would be scanned, home trash first, and exit.
+Each rejected candidate is printed as
+\fBparent_not_sticky: \fI<path>\fR
+or
+\fBparent_is_symlink: \fI<path>\fR.
+.TP
+.B \-\-trash\-dir \fIDIR\fR
+List only the given trash can; the option is repeatable, the cans are
+scanned in the order given.
+The value replaces discovery completely and is used as\-is: no trust checks
+and no
+\fB\(ti\fR
+expansion; a nonexistent directory is silently empty.
+.TP
+.B \-\-all\-users
+List every account's trash cans;
+\fB\-\-trash\-dir\fR
+is ignored.
+.TP
+.B \-\-size
+Print the size of the backup copy instead of the date.
+.TP
+.B \-\-files
+Append
+\fB\-> \fI<backup copy path>\fR
+to each line.
+.TP
+.B \-\-debug\-volumes
+Dump volume discovery data and exit.
+For debugging.
+.TP
+.B \-\-python
+Print the path of the program's own executable and exit.
+For debugging.
+.PP
+The last four options exist although they are undocumented upstream; they
+are mainly for testing and debugging.
+.SH TRASH DIRECTORIES
+Unless
+\fB\-\-trash\-dir\fR
+is given, the cans scanned are the home trash, that is
+\fI$XDG_DATA_HOME/Trash\fR
+when
+.B XDG_DATA_HOME
+is set and non\-empty and
+\fI$HOME/.local/share/Trash\fR
+otherwise, followed by, for every volume
+\fI$volume\fR,
+\fI$volume\fB/.Trash/\fI$uid\fR
+and
+\fI$volume\fB/.Trash\-\fI$uid\fR.
+.PP
+The volume list comes from
+.B TRASH_VOLUMES
+when set and non\-empty (colon\-separated, empty items dropped), otherwise
+from the system mount table filtered to real filesystems.
+.PP
+\fI$volume\fB/.Trash/\fI$uid\fR
+is scanned only if
+\fB$volume\fB/.Trash\fR
+exists, is a directory with the sticky bit, and is not a symlink; the sticky
+bit is checked before the symlink.
+A skipped directory is reported on standard error as
+\fBTrashDir skipped because parent not sticky: \fI<path>\fR
+or
+\fBTrashDir skipped because parent is symlink: \fI<path>\fR.
+\fI$volume\fB/.Trash\-\fI$uid\fR
+is scanned whenever it is a directory.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including runs that printed parse warnings: an unparsable
+trashinfo file, one that is not valid UTF\-8 included, is reported on
+standard error and skipped.
+.TP
+.B 2
+Usage error.
+.TP
+.B 1
+Fatal error, for example an unreadable
+.I info/
+directory.
+.SH ENVIRONMENT
+.TP
+.B XDG_DATA_HOME
+Location of the home trash,
+\fI$XDG_DATA_HOME/Trash\fR.
+Used only when set and non\-empty; an empty value is treated as unset, per
+the XDG basedir specification, so the home trash falls back to
+\fI$HOME/.local/share/Trash\fR.
+A relative value is used verbatim, resolved against the current directory.
+.TP
+.B HOME
+Fallback location of the home trash,
+\fI$HOME/.local/share/Trash\fR.
+.TP
+.B TRASH_VOLUMES
+Colon\-separated volume list overriding the mount table; empty items are
+dropped.
+.TP
+.B TRASH_RAW_OUTPUT
+When set, never shell\-quote paths, not even on a terminal.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/Trash
+The home trash, when
+.B XDG_DATA_HOME
+is set and non\-empty.
+.TP
+.I $HOME/.local/share/Trash
+The home trash otherwise.
+.SH EXAMPLES
+.RS
+.PP
+.nf
+trash\-list
+trash\-list \-\-trash\-dirs
+trash\-list \-\-trash\-dir /mnt/usb/.Trash\-1000
+.fi
+.RE
+.SH SEE ALSO
+.BR trash\-put (1),
+.BR trash (1),
+.BR trash\-restore (1),
+.BR trash\-empty (1),
+.BR trash\-rm (1).
+.PP
+Implements the FreeDesktop.org Trash Specification,
+https://specifications.freedesktop.org/trash\-spec/

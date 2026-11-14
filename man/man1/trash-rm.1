@@ -1,0 +1,140 @@
+.\" trash-rm(1) manual page for trash-cli.
+.TH TRASH-RM 1 2026-11-14 "trash-cli 0.26.9.29" "User Commands"
+.SH NAME
+trash\-rm \- remove individual files from the trash can
+.SH SYNOPSIS
+.B trash\-rm \fIPATTERN\fR
+.SH DESCRIPTION
+.B trash\-rm
+removes entries from the trash cans by pattern: for every matching
+trashinfo file, the backup copy in
+.I files/
+is removed first (if present, dangling symlinks included), then the info
+file itself.
+Entries of
+.I files/
+without an info file are never touched.
+Success is completely silent, whether zero or several entries matched.
+.PP
+There are no options:
+\fB\-\-help\fR
+and
+\fB\-\-version\fR
+do not exist, they are patterns.
+Extra arguments are silently ignored.
+With no argument a usage block is printed to standard error and the exit
+status is 8:
+.RS
+.PP
+.nf
+Usage:
+    trash\-rm PATTERN
+
+Please specify PATTERN.
+trash\-rm uses fnmatch.fnmatchcase to match patterns, see https://docs.python.org/3/library/fnmatch.html for more details.
+.fi
+.RE
+.SH ARGUMENTS
+.TP
+.I PATTERN
+A fnmatch(3) pattern, matched case\-sensitively everywhere
+(\fBfnmatchcase\fR
+semantics):
+\fB*\fR
+matches any string including
+\fB/\fR,
+\fB?\fR
+matches one character, and
+\fB[seq]\fR
+and
+\fB[!seq]\fR
+are character classes.
+A
+.I PATTERN
+starting with
+\fB/\fR
+is matched against the full original location; any other
+.I PATTERN
+is matched against the basename only, so a pattern with a
+\fB/\fR
+in a non\-leading position never matches.
+An empty
+.I PATTERN
+matches nothing and the exit status is 0.
+.SH TRASH DIRECTORIES
+The trash cans scanned are the home trash,
+\fI$XDG_DATA_HOME/Trash\fR
+when
+.B XDG_DATA_HOME
+is set and non\-empty and
+\fI$HOME/.local/share/Trash\fR
+otherwise, followed by, for every volume
+\fI$volume\fR,
+\fI$volume\fB/.Trash/\fI$uid\fR
+(trust\-checked, silently skipped when the checks fail) and
+\fI$volume\fB/.Trash\-\fI$uid\fR.
+\fBTRASH_VOLUMES\fR
+is honored, as in
+.BR trash\-list (1).
+.PP
+A trashinfo file that cannot be parsed is reported on standard error as
+\fBtrash\-rm: \fI<info path>\fB: unable to parse \(aqPath\(aq\fR
+and skipped; the scan continues.
+An entry that is not valid UTF\-8 is reported as
+\fBtrash\-rm: \fI<info path>\fB: unable to parse trashinfo (invalid UTF\-8)\fR
+and skipped the same way.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including a pattern that matched nothing and an empty pattern.
+.TP
+.B 8
+No pattern given.
+.TP
+.B 1
+Fatal error.
+.SH ENVIRONMENT
+.TP
+.B XDG_DATA_HOME
+Location of the home trash,
+\fI$XDG_DATA_HOME/Trash\fR.
+Used only when set and non\-empty; an empty value is treated as unset, per
+the XDG basedir specification, so the home trash falls back to
+\fI$HOME/.local/share/Trash\fR.
+A relative value is used verbatim, resolved against the current directory.
+.TP
+.B HOME
+Fallback location of the home trash,
+\fI$HOME/.local/share/Trash\fR.
+.TP
+.B TRASH_VOLUMES
+Colon\-separated volume list overriding the mount table; empty items are
+dropped.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/Trash
+The home trash, when
+.B XDG_DATA_HOME
+is set and non\-empty.
+.TP
+.I $HOME/.local/share/Trash
+The home trash otherwise.
+.SH EXAMPLES
+.RS
+.PP
+.nf
+trash\-rm notes.txt
+trash\-rm *.o
+trash\-rm /home/user/work/scratch*
+.fi
+.RE
+.SH SEE ALSO
+.BR trash\-put (1),
+.BR trash (1),
+.BR trash\-list (1),
+.BR trash\-restore (1),
+.BR trash\-empty (1),
+.BR fnmatch (3).
+.PP
+Implements the FreeDesktop.org Trash Specification,
+https://specifications.freedesktop.org/trash\-spec/
